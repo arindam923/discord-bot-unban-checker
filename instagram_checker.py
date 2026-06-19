@@ -1,15 +1,17 @@
 """
-Checks an Instagram profile using Instagram's public web_profile_info API.
+Checks an Instagram profile by fetching the public profile page HTML via aiohttp
+and parsing og:meta tags and page content for status detection.
 
-Requires a session cookie warmup (visiting the Instagram homepage first) to get
-a csrftoken. Without it, the API returns HTTP 429. Cookies persist across calls
-via a module-level CookieJar so we only pay the warmup cost once per bot run.
+A cookie warmup (GET instagram.com) is done once per bot run to obtain session
+cookies that reduce rate-limiting. The raw HTML approach avoids Instagram's
+API rate-limiting which aggressively blocks datacenter IPs.
 
-Returns full profile data (followers, following, posts, full name, bio, avatar
-URL) without a browser or login. Works reliably from any IP.
+If even the HTML fetch fails (blank page, 403, redirect to login), the bot
+falls back to "unknown" status.
 """
 
 import asyncio
+import re
 import ssl
 import time
 
@@ -30,22 +32,56 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-INSTAGRAM_APP_ID = "9366197433924594"
-API_URL = "https://www.instagram.com/api/v1/users/web_profile_info/"
 HOMEPAGE_URL = "https://www.instagram.com/"
 
-# Shared cookie jar so csrftoken persists across checks within a single bot run
+# Shared cookie jar across checks within a single bot run
 _COOKIE_JAR: "CookieJar | None" = None
 _COOKIES_WARMED = False
 _WARMUP_LOCK = asyncio.Lock()
 
-# Per-username cooldown to avoid hammering the same account
+# Per-username cooldown
 _last_check: dict[str, float] = {}
 _MIN_INTERVAL = 5.0
 
+# Profile-page markup markers that indicate a banned / unavailable account
+NOT_FOUND_MARKERS = [
+    "isn't available",
+    "may be broken",
+    "may have been removed",
+    "page not found",
+    "user not found",
+    "sorry, this page isn't available",
+]
+
+# Regex to parse counts from og:description: "1,234 Followers, 567 Following, 89 Posts"
+FOLLOWERS_RE = re.compile(r"([\d,]+(?:[.,]\d+)?[KkMm]?)\s+Followers", re.IGNORECASE)
+FOLLOWING_RE = re.compile(r"([\d,]+)\s+Following", re.IGNORECASE)
+POSTS_RE = re.compile(r"([\d,]+)\s+Posts", re.IGNORECASE)
+
+# Parse full name from og:title: "Full Name (@username) • Instagram ..."
+TITLE_NAME_RE = re.compile(r"^(.+?)\s*\(@")
+
+
+def _parse_count(text: str) -> int | None:
+    """Parses Instagram's abbreviated counts: '104M', '27.8K', '1,234', etc."""
+    if not text:
+        return None
+    s = text.replace(",", "").strip()
+    mult = 1
+    if s and s[-1] in "Kk":
+        mult = 1_000
+        s = s[:-1]
+    elif s and s[-1] in "Mm":
+        mult = 1_000_000
+        s = s[:-1]
+    try:
+        return int(float(s) * mult)
+    except (ValueError, TypeError):
+        return None
+
 
 async def _warmup_cookies(ssl_context=None) -> None:
-    """Visit Instagram homepage once to seed cookies (csrftoken, ig_did, mid)."""
+    """Visit Instagram homepage once to seed session cookies."""
     global _COOKIES_WARMED, _COOKIE_JAR
     if _COOKIES_WARMED:
         return
@@ -69,20 +105,25 @@ async def _warmup_cookies(ssl_context=None) -> None:
                     timeout=aiohttp.ClientTimeout(total=15),
                     ssl=ssl_context,
                 ) as resp:
-                    await resp.read()  # consume body to populate cookies
+                    await resp.read()
             _COOKIES_WARMED = True
-            csrf = _get_csrftoken()
-            print(f"  [cookies] warmed up (csrftoken={'yes' if csrf else 'no'})")
+            print("  [cookies] warmed up")
         except Exception as e:
             print(f"  [cookies] warmup failed: {e!r}")
 
 
-def _get_csrftoken() -> str | None:
-    if _COOKIE_JAR is None:
-        return None
-    for cookie in _COOKIE_JAR:
-        if cookie.key == "csrftoken":
-            return cookie.value
+def _extract_meta(html: str, prop: str) -> str | None:
+    """Extract content from an og: meta tag in HTML."""
+    # Match: <meta property="og:title" content="..." />
+    pattern = rf'<meta\s+property=["\']og:{prop}["\']\s+content=["\']([^"\']*)["\']'
+    m = re.search(pattern, html, re.IGNORECASE)
+    if m:
+        return m.group(1)
+    # Try alternate attribute order: <meta content="..." property="og:title" />
+    pattern2 = rf'<meta\s+content=["\']([^"\']*)["\']\s+property=["\']og:{prop}["\']'
+    m = re.search(pattern2, html, re.IGNORECASE)
+    if m:
+        return m.group(1)
     return None
 
 
@@ -138,68 +179,103 @@ async def check_instagram_account(username: str, output_path: str) -> dict:
         await asyncio.sleep(_MIN_INTERVAL - (now - last))
     _last_check[username] = time.time()
 
-    # Ensure we have session cookies before calling the API
+    # Ensure session cookies are seeded
     await _warmup_cookies(_AIOHTTP_SSL)
 
-    csrftoken = _get_csrftoken()
+    url = f"https://www.instagram.com/{username}/"
     headers = {
         "User-Agent": USER_AGENT,
-        "X-IG-App-ID": INSTAGRAM_APP_ID,
-        "Accept": "application/json, text/plain, */*",
+        "Accept": (
+            "text/html,application/xhtml+xml,"
+            "application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
+        ),
         "Accept-Language": "en-US,en;q=0.9",
-        "Referer": f"https://www.instagram.com/{username}/",
-        "Origin": "https://www.instagram.com",
+        "Referer": "https://www.instagram.com/",
         "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-Mode": "cors",
-        "Sec-Fetch-Dest": "empty",
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Dest": "document",
     }
-    if csrftoken:
-        headers["X-CSRFToken"] = csrftoken
 
-    url = f"{API_URL}?username={username}"
-
-    # Retry loop for transient rate-limiting
     for attempt in range(3):
         try:
             async with aiohttp.ClientSession(cookie_jar=_COOKIE_JAR) as session:
                 async with session.get(
                     url,
                     headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=15),
+                    timeout=aiohttp.ClientTimeout(total=20),
                     ssl=_AIOHTTP_SSL,
+                    allow_redirects=True,
                 ) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        user = data.get("data", {}).get("user")
-
-                        if user is None:
-                            result["status"] = "banned"
-                        else:
-                            result["status"] = "active"
-                            result["followers"] = user.get("edge_followed_by", {}).get(
-                                "count"
-                            )
-                            result["following"] = user.get("edge_follow", {}).get(
-                                "count"
-                            )
-                            result["posts"] = user.get(
-                                "edge_owner_to_timeline_media", {}
-                            ).get("count")
-                            result["full_name"] = user.get("full_name")
-                            result["bio"] = user.get("biography")
-
-                            avatar_url = user.get("profile_pic_url_hd") or user.get(
-                                "profile_pic_url"
-                            )
-                            if avatar_url:
-                                result["avatar_bytes"] = await _download_avatar(
-                                    avatar_url
-                                )
-                        break  # success — exit retry loop
-
-                    elif resp.status == 404:
+                    if resp.status == 404:
                         result["status"] = "banned"
                         break
+
+                    if resp.status == 200:
+                        # Check if we were redirected to login or challenge page
+                        final_url = str(resp.real_url)
+                        if "accounts/login" in final_url or "challenge" in final_url:
+                            print(
+                                f"  [blocked] @{username}: redirected to "
+                                f"login/challenge page"
+                            )
+                            result["status"] = "unknown"
+                            break
+
+                        html = await resp.text()
+                        html_lower = html.lower()
+
+                        # -- Detect banned / unavailable ----------------------------------
+                        if any(m in html_lower for m in NOT_FOUND_MARKERS):
+                            result["status"] = "banned"
+                            break
+
+                        # -- Extract og:meta tags ------------------------------------------
+                        meta_title = _extract_meta(html, "title")
+                        meta_desc = _extract_meta(html, "description")
+                        og_image = _extract_meta(html, "image")
+
+                        # -- Parse counts from og:description ----------------------------
+                        if meta_desc:
+                            f_m = FOLLOWERS_RE.search(meta_desc)
+                            g_m = FOLLOWING_RE.search(meta_desc)
+                            p_m = POSTS_RE.search(meta_desc)
+                            if f_m:
+                                result["followers"] = _parse_count(f_m.group(1))
+                            if g_m:
+                                result["following"] = _parse_count(g_m.group(1))
+                            if p_m:
+                                result["posts"] = _parse_count(p_m.group(1))
+
+                        # -- Parse full_name from og:title -------------------------------
+                        if meta_title:
+                            m = TITLE_NAME_RE.match(meta_title)
+                            if m:
+                                candidate = m.group(1).strip()
+                                if candidate.lower() != username.lower():
+                                    result["full_name"] = candidate
+
+                        # -- Classify status ----------------------------------------------
+                        if result["followers"] is not None or (
+                            meta_title and username.lower() in meta_title.lower()
+                        ):
+                            result["status"] = "active"
+                        elif meta_title is None and meta_desc is None:
+                            # Empty page — likely blocked
+                            snippet = html[:200].replace("\n", " ")
+                            print(
+                                f"  [empty-page] @{username}: no meta tags, "
+                                f"html_snippet='{snippet}'"
+                            )
+                            result["status"] = "unknown"
+                        else:
+                            # Has some meta tags but couldn't confirm active
+                            result["status"] = "unknown"
+
+                        # -- Download avatar --------------------------------------------
+                        if og_image:
+                            result["avatar_bytes"] = await _download_avatar(og_image)
+
+                        break  # success — exit retry loop
 
                     elif resp.status == 429:
                         wait = 15 * (attempt + 1)
@@ -209,16 +285,21 @@ async def check_instagram_account(username: str, output_path: str) -> dict:
                         )
                         await asyncio.sleep(wait)
                         # Re-warmup cookies in case they expired
+                        global _COOKIES_WARMED
                         _COOKIES_WARMED = False
                         await _warmup_cookies(_AIOHTTP_SSL)
-                        csrftoken = _get_csrftoken()
-                        if csrftoken:
-                            headers["X-CSRFToken"] = csrftoken
+
+                    elif resp.status in (302, 301):
+                        loc = resp.headers.get("Location", "")
+                        if "login" in loc or "challenge" in loc:
+                            print(f"  [blocked] @{username}: 302 redirect to login")
+                        result["status"] = "unknown"
+                        break
 
                     else:
                         text = await resp.text()
                         print(
-                            f"  [api-error] @{username}: HTTP {resp.status} "
+                            f"  [http-error] @{username}: HTTP {resp.status} "
                             f"{text[:200]}"
                         )
                         break
