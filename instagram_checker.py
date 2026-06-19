@@ -19,7 +19,15 @@ import re
 import ssl
 
 import aiohttp
+from dotenv import load_dotenv
 from playwright.async_api import async_playwright
+
+load_dotenv()
+
+PROXY_HOST = os.getenv("PROXY_HOST")
+PROXY_PORT = os.getenv("PROXY_PORT")
+PROXY_USER = os.getenv("PROXY_USER")
+PROXY_PASS = os.getenv("PROXY_PASS")
 
 try:
     import certifi
@@ -141,14 +149,22 @@ async def check_instagram_account(username: str, output_path: str) -> dict:
                 "--disable-dev-shm-usage",
             ],
         )
-        context = await browser.new_context(
-            user_agent=USER_AGENT,
-            viewport=VIEWPORT,
-            locale="en-US",
-            timezone_id="America/New_York",
-            geolocation={"latitude": 40.7128, "longitude": -74.0060},
-            permissions=["geolocation"],
-        )
+        context_kwargs = {
+            "user_agent": USER_AGENT,
+            "viewport": VIEWPORT,
+            "locale": "en-US",
+            "timezone_id": "America/New_York",
+            "geolocation": {"latitude": 40.7128, "longitude": -74.0060},
+            "permissions": ["geolocation"],
+        }
+        if PROXY_HOST and PROXY_PORT:
+            proxy_cfg = {"server": f"http://{PROXY_HOST}:{PROXY_PORT}"}
+            if PROXY_USER and PROXY_PASS:
+                proxy_cfg["username"] = PROXY_USER
+                proxy_cfg["password"] = PROXY_PASS
+            context_kwargs["proxy"] = proxy_cfg
+            print(f"  [proxy] using {PROXY_HOST}:{PROXY_PORT}")
+        context = await browser.new_context(**context_kwargs)
         page = await context.new_page()
         try:
             # Random delay to avoid rate-limit/bot patterns
