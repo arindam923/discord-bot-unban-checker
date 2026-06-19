@@ -1,29 +1,32 @@
 """
-Checks an Instagram profile by fetching the public profile page HTML via aiohttp
-and parsing og:meta tags and page content for status detection.
+Checks an Instagram profile, extracts metadata via og:meta tags (no
+screenshots), and renders a styled profile card image.
 
-A cookie warmup (GET instagram.com) is done once per bot run to obtain session
-cookies that reduce rate-limiting. The raw HTML approach avoids Instagram's
-API rate-limiting which aggressively blocks datacenter IPs.
+The headless browser is used only for page loading and status detection.
+Profile data (name, avatar URL, follower/post counts, bio) comes from
+Instagram's server-rendered og:meta tags, which are always present -- even
+when a login wall popup covers the visible page.  This means the extracted
+data is reliable regardless of overlay popups.
 
-If even the HTML fetch fails (blank page, 403, redirect to login), the bot
-falls back to "unknown" status.
+The avatar image is downloaded separately via aiohttp from the og:image URL
+and passed to card_renderer.render_profile_card to produce the final PNG.
 """
 
-import asyncio
+import json
+import os
+import random
 import re
 import ssl
-import time
 
 import aiohttp
-from aiohttp import CookieJar
+from playwright.async_api import async_playwright
 
 try:
     import certifi
 
     _AIOHTTP_SSL = ssl.create_default_context(cafile=certifi.where())
 except Exception:
-    _AIOHTTP_SSL = None
+    _AIOHTTP_SSL = None  # fall back to default (system) CA bundle
 
 from card_renderer import render_profile_card
 
@@ -32,34 +35,19 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-HOMEPAGE_URL = "https://www.instagram.com/"
+VIEWPORT = {"width": 1100, "height": 900}
 
-# Shared cookie jar across checks within a single bot run
-_COOKIE_JAR: "CookieJar | None" = None
-_COOKIES_WARMED = False
-_WARMUP_LOCK = asyncio.Lock()
-
-# Per-username cooldown
-_last_check: dict[str, float] = {}
-_MIN_INTERVAL = 5.0
-
-# Profile-page markup markers that indicate a banned / unavailable account
 NOT_FOUND_MARKERS = [
     "isn't available",
     "may be broken",
     "may have been removed",
     "page not found",
     "user not found",
-    "sorry, this page isn't available",
 ]
 
-# Regex to parse counts from og:description: "1,234 Followers, 567 Following, 89 Posts"
 FOLLOWERS_RE = re.compile(r"([\d,]+(?:[.,]\d+)?[KkMm]?)\s+Followers", re.IGNORECASE)
 FOLLOWING_RE = re.compile(r"([\d,]+)\s+Following", re.IGNORECASE)
 POSTS_RE = re.compile(r"([\d,]+)\s+Posts", re.IGNORECASE)
-
-# Parse full name from og:title: "Full Name (@username) • Instagram ..."
-TITLE_NAME_RE = re.compile(r"^(.+?)\s*\(@")
 
 
 def _parse_count(text: str) -> int | None:
@@ -80,51 +68,7 @@ def _parse_count(text: str) -> int | None:
         return None
 
 
-async def _warmup_cookies(ssl_context=None) -> None:
-    """Visit Instagram homepage once to seed session cookies."""
-    global _COOKIES_WARMED, _COOKIE_JAR
-    if _COOKIES_WARMED:
-        return
-    async with _WARMUP_LOCK:
-        if _COOKIES_WARMED:
-            return
-        if _COOKIE_JAR is None:
-            _COOKIE_JAR = CookieJar()
-        try:
-            async with aiohttp.ClientSession(cookie_jar=_COOKIE_JAR) as session:
-                async with session.get(
-                    HOMEPAGE_URL,
-                    headers={
-                        "User-Agent": USER_AGENT,
-                        "Accept": (
-                            "text/html,application/xhtml+xml,"
-                            "application/xml;q=0.9,*/*;q=0.8"
-                        ),
-                        "Accept-Language": "en-US,en;q=0.9",
-                    },
-                    timeout=aiohttp.ClientTimeout(total=15),
-                    ssl=ssl_context,
-                ) as resp:
-                    await resp.read()
-            _COOKIES_WARMED = True
-            print("  [cookies] warmed up")
-        except Exception as e:
-            print(f"  [cookies] warmup failed: {e!r}")
-
-
-def _extract_meta(html: str, prop: str) -> str | None:
-    """Extract content from an og: meta tag in HTML."""
-    # Match: <meta property="og:title" content="..." />
-    pattern = rf'<meta\s+property=["\']og:{prop}["\']\s+content=["\']([^"\']*)["\']'
-    m = re.search(pattern, html, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    # Try alternate attribute order: <meta content="..." property="og:title" />
-    pattern2 = rf'<meta\s+content=["\']([^"\']*)["\']\s+property=["\']og:{prop}["\']'
-    m = re.search(pattern2, html, re.IGNORECASE)
-    if m:
-        return m.group(1)
-    return None
+TITLE_NAME_RE = re.compile(r"^(.+?)\s*\(@")
 
 
 async def _download_avatar(url: str) -> bytes | None:
@@ -137,6 +81,19 @@ async def _download_avatar(url: str) -> bytes | None:
                 timeout=aiohttp.ClientTimeout(total=10),
                 headers={"User-Agent": USER_AGENT},
                 ssl=_AIOHTTP_SSL,
+            ) as resp:
+                if resp.status == 200:
+                    data = await resp.read()
+                    if data and len(data) > 100:
+                        return data
+    except Exception:
+        return None
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+                url,
+                timeout=aiohttp.ClientTimeout(total=10),
+                headers={"User-Agent": USER_AGENT},
             ) as resp:
                 if resp.status == 200:
                     data = await resp.read()
@@ -172,149 +129,158 @@ async def check_instagram_account(username: str, output_path: str) -> dict:
         "avatar_bytes": None,
     }
 
-    # Per-username cooldown
-    now = time.time()
-    last = _last_check.get(username, 0)
-    if now - last < _MIN_INTERVAL:
-        await asyncio.sleep(_MIN_INTERVAL - (now - last))
-    _last_check[username] = time.time()
-
-    # Ensure session cookies are seeded
-    await _warmup_cookies(_AIOHTTP_SSL)
-
     url = f"https://www.instagram.com/{username}/"
-    headers = {
-        "User-Agent": USER_AGENT,
-        "Accept": (
-            "text/html,application/xhtml+xml,"
-            "application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.instagram.com/",
-        "Sec-Fetch-Site": "same-origin",
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Dest": "document",
-    }
+    og_image = None
 
-    for attempt in range(3):
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
+        context = await browser.new_context(
+            user_agent=USER_AGENT,
+            viewport=VIEWPORT,
+            locale="en-US",
+            timezone_id="America/New_York",
+            geolocation={"latitude": 40.7128, "longitude": -74.0060},
+            permissions=["geolocation"],
+        )
+        page = await context.new_page()
         try:
-            async with aiohttp.ClientSession(cookie_jar=_COOKIE_JAR) as session:
-                async with session.get(
-                    url,
-                    headers=headers,
-                    timeout=aiohttp.ClientTimeout(total=20),
-                    ssl=_AIOHTTP_SSL,
-                    allow_redirects=True,
-                ) as resp:
-                    if resp.status == 404:
-                        result["status"] = "banned"
-                        break
+            # Random delay to avoid rate-limit/bot patterns
+            await page.wait_for_timeout(random.randint(300, 1500))
+            # Navigate with a referer to look like organic traffic
+            await page.goto(
+                "https://www.instagram.com/",
+                wait_until="domcontentloaded",
+                timeout=25000,
+            )
+            await page.wait_for_timeout(random.randint(800, 2000))
+            await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            # Wait for Instagram's React hydration to populate og:meta tags
+            try:
+                await page.wait_for_selector('meta[property="og:title"]', timeout=6000)
+            except Exception:
+                pass
+            await page.wait_for_timeout(2000)
 
-                    if resp.status == 200:
-                        # Check if we were redirected to login or challenge page
-                        final_url = str(resp.real_url)
-                        if "accounts/login" in final_url or "challenge" in final_url:
-                            print(
-                                f"  [blocked] @{username}: redirected to "
-                                f"login/challenge page"
-                            )
-                            result["status"] = "unknown"
+            title = (await page.title()).lower()
+            try:
+                body_text = (await page.inner_text("body", timeout=5000)).lower()
+            except Exception:
+                body_text = ""
+
+            # -- og:meta extraction with short timeouts ---------------------------
+            async def _safe_meta(selector, attr, timeout_ms=4000):
+                try:
+                    loc = page.locator(selector)
+                    if await loc.count() == 0:
+                        return None
+                    return await loc.first.get_attribute(attr, timeout=timeout_ms)
+                except Exception:
+                    return None
+
+            meta_desc = await _safe_meta('meta[property="og:description"]', "content")
+            meta_title = await _safe_meta('meta[property="og:title"]', "content")
+            og_image = await _safe_meta('meta[property="og:image"]', "content")
+
+            # -- Parse counts from og:description --------------------------------
+            if meta_desc:
+                f_m = FOLLOWERS_RE.search(meta_desc)
+                g_m = FOLLOWING_RE.search(meta_desc)
+                p_m = POSTS_RE.search(meta_desc)
+                if f_m:
+                    result["followers"] = _parse_count(f_m.group(1))
+                if g_m:
+                    result["following"] = _parse_count(g_m.group(1))
+                if p_m:
+                    result["posts"] = _parse_count(p_m.group(1))
+
+            # -- Parse full_name from og:title -----------------------------------
+            # Typical: "Full Name (@username) • Instagram"
+            if meta_title:
+                m = TITLE_NAME_RE.match(meta_title)
+                if m:
+                    candidate = m.group(1).strip()
+                    if candidate.lower() != username.lower():
+                        result["full_name"] = candidate
+
+            # -- Try to extract bio from ld+json or page -------------------------
+            try:
+                ld_nodes = page.locator('script[type="application/ld+json"]')
+                count = await ld_nodes.count()
+                for i in range(min(count, 3)):  # bound the loop
+                    try:
+                        raw = await ld_nodes.nth(i).inner_text(timeout=2000)
+                        data = json.loads(raw)
+                        desc = data.get("description", "")
+                        if desc and len(desc) > 0:
+                            result["bio"] = desc.strip()
                             break
-
-                        html = await resp.text()
-                        html_lower = html.lower()
-
-                        # -- Detect banned / unavailable ----------------------------------
-                        if any(m in html_lower for m in NOT_FOUND_MARKERS):
-                            result["status"] = "banned"
-                            break
-
-                        # -- Extract og:meta tags ------------------------------------------
-                        meta_title = _extract_meta(html, "title")
-                        meta_desc = _extract_meta(html, "description")
-                        og_image = _extract_meta(html, "image")
-
-                        # -- Parse counts from og:description ----------------------------
-                        if meta_desc:
-                            f_m = FOLLOWERS_RE.search(meta_desc)
-                            g_m = FOLLOWING_RE.search(meta_desc)
-                            p_m = POSTS_RE.search(meta_desc)
-                            if f_m:
-                                result["followers"] = _parse_count(f_m.group(1))
-                            if g_m:
-                                result["following"] = _parse_count(g_m.group(1))
-                            if p_m:
-                                result["posts"] = _parse_count(p_m.group(1))
-
-                        # -- Parse full_name from og:title -------------------------------
-                        if meta_title:
-                            m = TITLE_NAME_RE.match(meta_title)
-                            if m:
-                                candidate = m.group(1).strip()
-                                if candidate.lower() != username.lower():
-                                    result["full_name"] = candidate
-
-                        # -- Classify status ----------------------------------------------
-                        if result["followers"] is not None or (
-                            meta_title and username.lower() in meta_title.lower()
-                        ):
-                            result["status"] = "active"
-                        elif meta_title is None and meta_desc is None:
-                            # Empty page — likely blocked
-                            snippet = html[:200].replace("\n", " ")
-                            print(
-                                f"  [empty-page] @{username}: no meta tags, "
-                                f"html_snippet='{snippet}'"
-                            )
-                            result["status"] = "unknown"
-                        else:
-                            # Has some meta tags but couldn't confirm active
-                            result["status"] = "unknown"
-
-                        # -- Download avatar --------------------------------------------
-                        if og_image:
-                            result["avatar_bytes"] = await _download_avatar(og_image)
-
-                        break  # success — exit retry loop
-
-                    elif resp.status == 429:
-                        wait = 15 * (attempt + 1)
-                        print(
-                            f"  [rate-limit] @{username}: HTTP 429 "
-                            f"(attempt {attempt + 1}/3) — waiting {wait}s"
-                        )
-                        await asyncio.sleep(wait)
-                        # Re-warmup cookies in case they expired
-                        global _COOKIES_WARMED
-                        _COOKIES_WARMED = False
-                        await _warmup_cookies(_AIOHTTP_SSL)
-
-                    elif resp.status in (302, 301):
-                        loc = resp.headers.get("Location", "")
-                        if "login" in loc or "challenge" in loc:
-                            print(f"  [blocked] @{username}: 302 redirect to login")
-                        result["status"] = "unknown"
+                    except (json.JSONDecodeError, AttributeError):
+                        continue
+                    except Exception:
                         break
+            except Exception:
+                pass
 
-                    else:
-                        text = await resp.text()
-                        print(
-                            f"  [http-error] @{username}: HTTP {resp.status} "
-                            f"{text[:200]}"
-                        )
-                        break
-
-        except aiohttp.ClientError as e:
-            print(f"  [network-error] @{username}: {e!r}")
-            if attempt < 2:
-                await asyncio.sleep(5)
+            # -- Classify status --------------------------------------------------
+            # IMPORTANT: detect "banned" FIRST, because Instagram's removed-profile
+            # page has title "Profile isn't available" but no og:meta tags.
+            haystack = f"{title} {body_text}"
+            if any(marker in haystack for marker in NOT_FOUND_MARKERS):
+                result["status"] = "banned"
+            elif result["followers"] is not None or (
+                meta_title and username.lower() in meta_title.lower()
+            ):
+                result["status"] = "active"
+            elif username.lower() in title:
+                # Page title mentions the username (e.g. "@username on Instagram")
+                # but no meta tags were found — likely active but page loaded oddly.
+                result["status"] = "active"
             else:
-                break
-        except Exception as e:
-            print(f"  [unexpected-error] @{username}: {e!r}")
-            break
+                # Log what we saw so we can diagnose why it's unknown
+                snippet = body_text[:200].replace("\n", " ") if body_text else "<empty>"
+                print(
+                    f"  [debug] @{username}: title='{title[:100]}' "
+                    f"meta_desc={'yes' if meta_desc else 'no'} "
+                    f"meta_title={'yes' if meta_title else 'no'} "
+                    f"body_snippet='{snippet}'"
+                )
+                result["status"] = "unknown"
 
-    # Render the profile card
+        except Exception as e:
+            print(f"Error loading page for @{username}: {e!r}")
+            try:
+                await browser.close()
+            except Exception:
+                pass
+
+            try:
+                render_profile_card(
+                    username=username,
+                    output_path=output_path,
+                    status=result["status"],
+                )
+                result["image"] = output_path
+            except Exception:
+                result["image"] = None
+            return result
+
+        try:
+            await browser.close()
+        except Exception:
+            pass
+
+    # -- Download avatar (outside browser context, using aiohttp) ---------------
+    if og_image:
+        result["avatar_bytes"] = await _download_avatar(og_image)
+
+    # -- Render the profile card ------------------------------------------------
     try:
         render_profile_card(
             username=username,
