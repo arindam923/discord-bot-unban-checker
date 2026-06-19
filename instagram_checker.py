@@ -14,6 +14,7 @@ and passed to card_renderer.render_profile_card to produce the final PNG.
 
 import json
 import os
+import random
 import re
 import ssl
 
@@ -132,14 +133,34 @@ async def check_instagram_account(username: str, output_path: str) -> dict:
     og_image = None
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=True)
+        browser = await p.chromium.launch(
+            headless=True,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
         context = await browser.new_context(
             user_agent=USER_AGENT,
             viewport=VIEWPORT,
+            locale="en-US",
+            timezone_id="America/New_York",
+            geolocation={"latitude": 40.7128, "longitude": -74.0060},
+            permissions=["geolocation"],
         )
         page = await context.new_page()
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            # Random delay to avoid rate-limit/bot patterns
+            await page.wait_for_timeout(random.randint(300, 1500))
+            # Navigate with a referer to look like organic traffic
+            await page.goto(
+                "https://www.instagram.com/",
+                wait_until="domcontentloaded",
+                timeout=25000,
+            )
+            await page.wait_for_timeout(random.randint(800, 2000))
+            await page.goto(url, wait_until="domcontentloaded", timeout=25000)
             # Wait for Instagram's React hydration to populate og:meta tags
             try:
                 await page.wait_for_selector('meta[property="og:title"]', timeout=6000)
