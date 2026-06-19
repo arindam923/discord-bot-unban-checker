@@ -139,7 +139,12 @@ async def check_instagram_account(username: str, output_path: str) -> dict:
         )
         page = await context.new_page()
         try:
-            await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+            await page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            # Wait for Instagram's React hydration to populate og:meta tags
+            try:
+                await page.wait_for_selector('meta[property="og:title"]', timeout=6000)
+            except Exception:
+                pass
             await page.wait_for_timeout(2000)
 
             title = (await page.title()).lower()
@@ -149,10 +154,7 @@ async def check_instagram_account(username: str, output_path: str) -> dict:
                 body_text = ""
 
             # -- og:meta extraction with short timeouts ---------------------------
-            # NOTE: banned/removed profile pages may omit some meta tags entirely,
-            # so each locator call uses a short timeout (NOT the 30s default)
-            # and is wrapped in a try block that catches timeouts.
-            async def _safe_meta(selector, attr, timeout_ms=3000):
+            async def _safe_meta(selector, attr, timeout_ms=4000):
                 try:
                     loc = page.locator(selector)
                     if await loc.count() == 0:
@@ -215,7 +217,19 @@ async def check_instagram_account(username: str, output_path: str) -> dict:
                 meta_title and username.lower() in meta_title.lower()
             ):
                 result["status"] = "active"
+            elif username.lower() in title:
+                # Page title mentions the username (e.g. "@username on Instagram")
+                # but no meta tags were found — likely active but page loaded oddly.
+                result["status"] = "active"
             else:
+                # Log what we saw so we can diagnose why it's unknown
+                snippet = body_text[:200].replace("\n", " ") if body_text else "<empty>"
+                print(
+                    f"  [debug] @{username}: title='{title[:100]}' "
+                    f"meta_desc={'yes' if meta_desc else 'no'} "
+                    f"meta_title={'yes' if meta_title else 'no'} "
+                    f"body_snippet='{snippet}'"
+                )
                 result["status"] = "unknown"
 
         except Exception as e:
