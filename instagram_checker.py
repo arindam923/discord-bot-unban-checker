@@ -35,7 +35,7 @@ API_URL = "https://www.instagram.com/api/v1/users/web_profile_info/"
 HOMEPAGE_URL = "https://www.instagram.com/"
 
 # Shared cookie jar so csrftoken persists across checks within a single bot run
-_COOKIE_JAR = CookieJar()
+_COOKIE_JAR: "CookieJar | None" = None
 _COOKIES_WARMED = False
 _WARMUP_LOCK = asyncio.Lock()
 
@@ -46,12 +46,14 @@ _MIN_INTERVAL = 5.0
 
 async def _warmup_cookies(ssl_context=None) -> None:
     """Visit Instagram homepage once to seed cookies (csrftoken, ig_did, mid)."""
-    global _COOKIES_WARMED
+    global _COOKIES_WARMED, _COOKIE_JAR
     if _COOKIES_WARMED:
         return
     async with _WARMUP_LOCK:
         if _COOKIES_WARMED:
             return
+        if _COOKIE_JAR is None:
+            _COOKIE_JAR = CookieJar()
         try:
             async with aiohttp.ClientSession(cookie_jar=_COOKIE_JAR) as session:
                 async with session.get(
@@ -76,6 +78,8 @@ async def _warmup_cookies(ssl_context=None) -> None:
 
 
 def _get_csrftoken() -> str | None:
+    if _COOKIE_JAR is None:
+        return None
     for cookie in _COOKIE_JAR:
         if cookie.key == "csrftoken":
             return cookie.value
