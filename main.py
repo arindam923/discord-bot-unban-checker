@@ -374,7 +374,7 @@ async def _reply(ctx, content: str | None = None, **kwargs):
 
 @bot.hybrid_command(
     name="checkbanned",
-    description="Watch Instagram account(s) and notify #banned when they get banned. Use commas or attach a .txt file.",
+    description="Watch IG accounts and post to #banned when banned. Use commas or attach a .txt file.",
 )
 async def checkbanned(
     ctx: commands.Context, file: discord.Attachment = None, *, username: str = None
