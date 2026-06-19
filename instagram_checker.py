@@ -1,23 +1,20 @@
 """
 Checks an Instagram profile using Instagram's public web_profile_info API.
 
-This endpoint returns JSON with full profile data (followers, following, posts,
-full name, bio, avatar URL) without requiring a browser or login. It works
-reliably from any IP — datacenter, residential, or otherwise — unlike browser
-scraping which Instagram blocks for non-residential IPs.
+Requires a session cookie warmup (visiting the Instagram homepage first) to get
+a csrftoken. Without it, the API returns HTTP 429. Cookies persist across calls
+via a module-level CookieJar so we only pay the warmup cost once per bot run.
 
-The avatar image is downloaded separately via aiohttp and passed to
-card_renderer.render_profile_card to produce the final PNG.
+Returns full profile data (followers, following, posts, full name, bio, avatar
+URL) without a browser or login. Works reliably from any IP.
 """
 
 import asyncio
-import json
-import os
-import re
 import ssl
 import time
 
 import aiohttp
+from aiohttp import CookieJar
 
 try:
     import certifi
@@ -35,10 +32,54 @@ USER_AGENT = (
 
 INSTAGRAM_APP_ID = "9366197433924594"
 API_URL = "https://www.instagram.com/api/v1/users/web_profile_info/"
+HOMEPAGE_URL = "https://www.instagram.com/"
 
-# Rate-limit tracking: simple in-memory per-username cooldown
+# Shared cookie jar so csrftoken persists across checks within a single bot run
+_COOKIE_JAR = CookieJar()
+_COOKIES_WARMED = False
+_WARMUP_LOCK = asyncio.Lock()
+
+# Per-username cooldown to avoid hammering the same account
 _last_check: dict[str, float] = {}
-_MIN_INTERVAL = 3.0  # seconds between API calls for the same username
+_MIN_INTERVAL = 5.0
+
+
+async def _warmup_cookies(ssl_context=None) -> None:
+    """Visit Instagram homepage once to seed cookies (csrftoken, ig_did, mid)."""
+    global _COOKIES_WARMED
+    if _COOKIES_WARMED:
+        return
+    async with _WARMUP_LOCK:
+        if _COOKIES_WARMED:
+            return
+        try:
+            async with aiohttp.ClientSession(cookie_jar=_COOKIE_JAR) as session:
+                async with session.get(
+                    HOMEPAGE_URL,
+                    headers={
+                        "User-Agent": USER_AGENT,
+                        "Accept": (
+                            "text/html,application/xhtml+xml,"
+                            "application/xml;q=0.9,*/*;q=0.8"
+                        ),
+                        "Accept-Language": "en-US,en;q=0.9",
+                    },
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    ssl=ssl_context,
+                ) as resp:
+                    await resp.read()  # consume body to populate cookies
+            _COOKIES_WARMED = True
+            csrf = _get_csrftoken()
+            print(f"  [cookies] warmed up (csrftoken={'yes' if csrf else 'no'})")
+        except Exception as e:
+            print(f"  [cookies] warmup failed: {e!r}")
+
+
+def _get_csrftoken() -> str | None:
+    for cookie in _COOKIE_JAR:
+        if cookie.key == "csrftoken":
+            return cookie.value
+    return None
 
 
 async def _download_avatar(url: str) -> bytes | None:
@@ -86,13 +127,17 @@ async def check_instagram_account(username: str, output_path: str) -> dict:
         "avatar_bytes": None,
     }
 
-    # Rate-limit: avoid hammering the same username too fast
+    # Per-username cooldown
     now = time.time()
     last = _last_check.get(username, 0)
     if now - last < _MIN_INTERVAL:
         await asyncio.sleep(_MIN_INTERVAL - (now - last))
     _last_check[username] = time.time()
 
+    # Ensure we have session cookies before calling the API
+    await _warmup_cookies(_AIOHTTP_SSL)
+
+    csrftoken = _get_csrftoken()
     headers = {
         "User-Agent": USER_AGENT,
         "X-IG-App-ID": INSTAGRAM_APP_ID,
@@ -104,55 +149,85 @@ async def check_instagram_account(username: str, output_path: str) -> dict:
         "Sec-Fetch-Mode": "cors",
         "Sec-Fetch-Dest": "empty",
     }
+    if csrftoken:
+        headers["X-CSRFToken"] = csrftoken
 
     url = f"{API_URL}?username={username}"
 
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url,
-                headers=headers,
-                timeout=aiohttp.ClientTimeout(total=15),
-                ssl=_AIOHTTP_SSL,
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    user = data.get("data", {}).get("user")
+    # Retry loop for transient rate-limiting
+    for attempt in range(3):
+        try:
+            async with aiohttp.ClientSession(cookie_jar=_COOKIE_JAR) as session:
+                async with session.get(
+                    url,
+                    headers=headers,
+                    timeout=aiohttp.ClientTimeout(total=15),
+                    ssl=_AIOHTTP_SSL,
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        user = data.get("data", {}).get("user")
 
-                    if user is None:
-                        # Null user → account banned, suspended, or deactivated
+                        if user is None:
+                            result["status"] = "banned"
+                        else:
+                            result["status"] = "active"
+                            result["followers"] = user.get("edge_followed_by", {}).get(
+                                "count"
+                            )
+                            result["following"] = user.get("edge_follow", {}).get(
+                                "count"
+                            )
+                            result["posts"] = user.get(
+                                "edge_owner_to_timeline_media", {}
+                            ).get("count")
+                            result["full_name"] = user.get("full_name")
+                            result["bio"] = user.get("biography")
+
+                            avatar_url = user.get("profile_pic_url_hd") or user.get(
+                                "profile_pic_url"
+                            )
+                            if avatar_url:
+                                result["avatar_bytes"] = await _download_avatar(
+                                    avatar_url
+                                )
+                        break  # success — exit retry loop
+
+                    elif resp.status == 404:
                         result["status"] = "banned"
-                    else:
-                        result["status"] = "active"
-                        result["followers"] = user.get("edge_followed_by", {}).get(
-                            "count"
-                        )
-                        result["following"] = user.get("edge_follow", {}).get("count")
-                        result["posts"] = user.get(
-                            "edge_owner_to_timeline_media", {}
-                        ).get("count")
-                        result["full_name"] = user.get("full_name")
-                        result["bio"] = user.get("biography")
+                        break
 
-                        avatar_url = user.get("profile_pic_url_hd") or user.get(
-                            "profile_pic_url"
+                    elif resp.status == 429:
+                        wait = 15 * (attempt + 1)
+                        print(
+                            f"  [rate-limit] @{username}: HTTP 429 "
+                            f"(attempt {attempt + 1}/3) — waiting {wait}s"
                         )
-                        if avatar_url:
-                            result["avatar_bytes"] = await _download_avatar(avatar_url)
-                elif resp.status == 404:
-                    result["status"] = "banned"
-                elif resp.status == 429:
-                    print(f"  [rate-limit] @{username}: HTTP 429 — cooling down 30s")
-                    await asyncio.sleep(30)
-                else:
-                    print(
-                        f"  [api-error] @{username}: HTTP {resp.status} "
-                        f"{await resp.text()[:200]}"
-                    )
-    except aiohttp.ClientError as e:
-        print(f"  [network-error] @{username}: {e!r}")
-    except Exception as e:
-        print(f"  [unexpected-error] @{username}: {e!r}")
+                        await asyncio.sleep(wait)
+                        # Re-warmup cookies in case they expired
+                        _COOKIES_WARMED = False
+                        await _warmup_cookies(_AIOHTTP_SSL)
+                        csrftoken = _get_csrftoken()
+                        if csrftoken:
+                            headers["X-CSRFToken"] = csrftoken
+
+                    else:
+                        text = await resp.text()
+                        print(
+                            f"  [api-error] @{username}: HTTP {resp.status} "
+                            f"{text[:200]}"
+                        )
+                        break
+
+        except aiohttp.ClientError as e:
+            print(f"  [network-error] @{username}: {e!r}")
+            if attempt < 2:
+                await asyncio.sleep(5)
+            else:
+                break
+        except Exception as e:
+            print(f"  [unexpected-error] @{username}: {e!r}")
+            break
 
     # Render the profile card
     try:

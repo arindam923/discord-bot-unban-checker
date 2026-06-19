@@ -64,7 +64,7 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 CHECK_INTERVAL_SECONDS = 10
-INTER_ACCOUNT_DELAY_SECONDS = 1  # small gap between distinct accounts within one tick
+INTER_ACCOUNT_DELAY_SECONDS = 5  # gap between distinct accounts within one tick
 
 # Every N iterations (~N*10s), post a one-line "still watching" message to
 # the channel for each active watch. Gives the user visible proof the bot is
