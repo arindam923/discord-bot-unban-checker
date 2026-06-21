@@ -10,6 +10,15 @@ data is reliable regardless of overlay popups.
 
 The avatar image is downloaded separately via aiohttp from the og:image URL
 and passed to card_renderer.render_profile_card to produce the final PNG.
+
+PROXY USAGE: to save proxy bandwidth, every check tries Instagram DIRECTLY
+first. Only if that direct attempt fails with a transport-level / IP-block
+signal (timeout, HTTP 403/429, login wall, empty page, network error) does
+the bot retry that single check through the proxy. Once a username has been
+flagged as "needs proxy", subsequent checks for that user go straight to
+proxy for PROXY_CACHE_TTL_SECONDS (default 24h), so we don't burn time on
+doomed direct attempts. Set FORCE_PROXY=true in .env to bypass the smart
+fallback (always use proxy) -- useful for debugging.
 """
 
 import json
@@ -17,6 +26,7 @@ import os
 import random
 import re
 import ssl
+import time
 
 import aiohttp
 from dotenv import load_dotenv
@@ -28,6 +38,8 @@ PROXY_HOST = os.getenv("PROXY_HOST")
 PROXY_PORT = os.getenv("PROXY_PORT")
 PROXY_USER = os.getenv("PROXY_USER")
 PROXY_PASS = os.getenv("PROXY_PASS")
+
+FORCE_PROXY = os.getenv("FORCE_PROXY", "").lower() in ("1", "true", "yes")
 
 try:
     import certifi
@@ -52,6 +64,28 @@ NOT_FOUND_MARKERS = [
     "page not found",
     "user not found",
 ]
+
+# Substrings (lowercased) that indicate the direct request was BLOCKED, not
+# that the account genuinely doesn't exist. If any of these show up in the
+# page title or body when og:meta is also missing, that's a soft-block /
+# login-wall and we should fall back to the proxy.
+DIRECT_BLOCK_MARKERS = [
+    "log in",
+    "sign up",
+    "please wait",
+    "rate limit",
+    "suspicious login",
+    "suspicious activity",
+    "temporarily blocked",
+    "try again later",
+    "your request was blocked",
+]
+
+PROXY_CACHE_TTL_SECONDS = 24 * 3600  # 24 hours
+
+# username -> expires_at_epoch (time.time())
+_proxy_cache: dict[str, float] = {}
+
 
 FOLLOWERS_RE = re.compile(r"([\d,]+(?:[.,]\d+)?[KkMm]?)\s+Followers", re.IGNORECASE)
 FOLLOWING_RE = re.compile(r"([\d,]+)\s+Following", re.IGNORECASE)
@@ -79,52 +113,84 @@ def _parse_count(text: str) -> int | None:
 TITLE_NAME_RE = re.compile(r"^(.+?)\s*\(@")
 
 
-async def _download_avatar(url: str) -> bytes | None:
+def _proxy_config() -> dict | None:
+    """Return Playwright proxy kwargs, or None if proxy isn't configured."""
+    if not PROXY_HOST or not PROXY_PORT:
+        return None
+    cfg = {"server": f"http://{PROXY_HOST}:{PROXY_PORT}"}
+    if PROXY_USER and PROXY_PASS:
+        cfg["username"] = PROXY_USER
+        cfg["password"] = PROXY_PASS
+    return cfg
+
+
+def _should_use_proxy(username: str) -> bool:
+    """Decide whether to skip the direct attempt and go straight to proxy."""
+    if FORCE_PROXY:
+        return True
+    expires = _proxy_cache.get(username.lower())
+    if expires is None:
+        return False
+    if time.time() >= expires:
+        # Expired -- drop it and treat as needing a fresh direct attempt.
+        _proxy_cache.pop(username.lower(), None)
+        return False
+    return True
+
+
+def _mark_needs_proxy(username: str) -> None:
+    """Cache this user as needing proxy for the next 24h."""
+    _proxy_cache[username.lower()] = time.time() + PROXY_CACHE_TTL_SECONDS
+
+
+async def _download_avatar(url: str, use_proxy: bool = False) -> bytes | None:
     if not url:
         return None
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url,
+    proxy_url = None
+    if use_proxy and PROXY_HOST and PROXY_PORT:
+        if PROXY_USER and PROXY_PASS:
+            proxy_url = f"http://{PROXY_USER}:{PROXY_PASS}@{PROXY_HOST}:{PROXY_PORT}"
+        else:
+            proxy_url = f"http://{PROXY_HOST}:{PROXY_PORT}"
+
+    for attempt_ssl in (_AIOHTTP_SSL, None):
+        try:
+            kwargs = dict(
                 timeout=aiohttp.ClientTimeout(total=10),
                 headers={"User-Agent": USER_AGENT},
-                ssl=_AIOHTTP_SSL,
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.read()
-                    if data and len(data) > 100:
-                        return data
-    except Exception:
-        return None
-    try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(
-                url,
-                timeout=aiohttp.ClientTimeout(total=10),
-                headers={"User-Agent": USER_AGENT},
-            ) as resp:
-                if resp.status == 200:
-                    data = await resp.read()
-                    if data and len(data) > 100:
-                        return data
-    except Exception:
-        pass
+            )
+            if attempt_ssl is not None:
+                kwargs["ssl"] = attempt_ssl
+            if proxy_url:
+                kwargs["proxy"] = proxy_url
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, **kwargs) as resp:
+                    if resp.status == 200:
+                        data = await resp.read()
+                        if data and len(data) > 100:
+                            return data
+        except Exception:
+            continue
     return None
 
 
-async def check_instagram_account(username: str, output_path: str) -> dict:
+async def _run_check(
+    username: str,
+    url: str,
+    use_proxy: bool,
+) -> tuple[dict, bool]:
     """
-    Returns a dict:
-      {
-        "status": "active" | "banned" | "unknown",
-        "image": path-or-None,
-        "followers": int-or-None,
-        "following": int-or-None,
-        "posts": int-or-None,
-        "full_name": str-or-None,
-        "bio": str-or-None,
-        "avatar_bytes": bytes-or-None,
-      }
+    Run a single browser session against Instagram for `username`.
+
+    Returns (result_dict, direct_failed_bool).
+      - result_dict has status/image/followers/... filled in from this attempt.
+      - direct_failed_bool is True iff this attempt hit a transport-level
+        / IP-block signal (timeout, network error, login wall, 403/429,
+        empty body with block markers). Caller uses it to decide whether to
+        fall back to the other path.
+
+    Note: result_dict['image'] is NOT populated here -- caller renders the
+    final card after choosing which attempt's data to keep.
     """
     result = {
         "status": "unknown",
@@ -136,9 +202,13 @@ async def check_instagram_account(username: str, output_path: str) -> dict:
         "bio": None,
         "avatar_bytes": None,
     }
-
-    url = f"https://www.instagram.com/{username}/"
+    direct_failed = False
     og_image = None
+    failure_reason = ""
+
+    proxy_cfg = _proxy_config() if use_proxy else None
+    if use_proxy and proxy_cfg:
+        print(f"  [proxy] using {PROXY_HOST}:{PROXY_PORT}")
 
     async with async_playwright() as p:
         browser = await p.chromium.launch(
@@ -157,26 +227,42 @@ async def check_instagram_account(username: str, output_path: str) -> dict:
             "geolocation": {"latitude": 40.7128, "longitude": -74.0060},
             "permissions": ["geolocation"],
         }
-        if PROXY_HOST and PROXY_PORT:
-            proxy_cfg = {"server": f"http://{PROXY_HOST}:{PROXY_PORT}"}
-            if PROXY_USER and PROXY_PASS:
-                proxy_cfg["username"] = PROXY_USER
-                proxy_cfg["password"] = PROXY_PASS
+        if proxy_cfg:
             context_kwargs["proxy"] = proxy_cfg
-            print(f"  [proxy] using {PROXY_HOST}:{PROXY_PORT}")
         context = await browser.new_context(**context_kwargs)
         page = await context.new_page()
         try:
             # Random delay to avoid rate-limit/bot patterns
             await page.wait_for_timeout(random.randint(300, 1500))
             # Navigate with a referer to look like organic traffic
-            await page.goto(
-                "https://www.instagram.com/",
-                wait_until="domcontentloaded",
-                timeout=25000,
-            )
+            try:
+                await page.goto(
+                    "https://www.instagram.com/",
+                    wait_until="domcontentloaded",
+                    timeout=25000,
+                )
+            except Exception as e:
+                failure_reason = f"homepage navigation: {type(e).__name__}"
+                raise
             await page.wait_for_timeout(random.randint(800, 2000))
-            await page.goto(url, wait_until="domcontentloaded", timeout=25000)
+            response = None
+            try:
+                response = await page.goto(
+                    url, wait_until="domcontentloaded", timeout=25000
+                )
+            except Exception as e:
+                failure_reason = f"profile navigation: {type(e).__name__}"
+                raise
+
+            # HTTP-level block (e.g. 403/429 from Instagram's edge)
+            if response is not None and response.status in (403, 429):
+                failure_reason = f"HTTP {response.status}"
+                direct_failed = True
+                print(
+                    f"  [proxy] @{username} direct attempt returned "
+                    f"{response.status}, treating as blocked"
+                )
+
             # Wait for Instagram's React hydration to populate og:meta tags
             try:
                 await page.wait_for_selector('meta[property="og:title"]', timeout=6000)
@@ -259,33 +345,44 @@ async def check_instagram_account(username: str, output_path: str) -> dict:
                 # but no meta tags were found — likely active but page loaded oddly.
                 result["status"] = "active"
             else:
-                # Log what we saw so we can diagnose why it's unknown
-                snippet = body_text[:200].replace("\n", " ") if body_text else "<empty>"
-                print(
-                    f"  [debug] @{username}: title='{title[:100]}' "
-                    f"meta_desc={'yes' if meta_desc else 'no'} "
-                    f"meta_title={'yes' if meta_title else 'no'} "
-                    f"body_snippet='{snippet}'"
+                # Distinguish "soft-blocked" from "real unknown" by checking for
+                # block markers in the body. This is what triggers proxy fallback.
+                is_blocked = any(m in haystack for m in DIRECT_BLOCK_MARKERS) or (
+                    response is not None and response.status in (403, 429)
                 )
-                result["status"] = "unknown"
+                if is_blocked:
+                    direct_failed = True
+                    failure_reason = (
+                        failure_reason or "block markers in body, no og:meta"
+                    )
+                    print(
+                        f"  [proxy] @{username} direct attempt looks "
+                        f"blocked ({failure_reason})"
+                    )
+                else:
+                    # Log what we saw so we can diagnose why it's unknown
+                    snippet = (
+                        body_text[:200].replace("\n", " ") if body_text else "<empty>"
+                    )
+                    print(
+                        f"  [debug] @{username}: title='{title[:100]}' "
+                        f"meta_desc={'yes' if meta_desc else 'no'} "
+                        f"meta_title={'yes' if meta_title else 'no'} "
+                        f"body_snippet='{snippet}'"
+                    )
+                    result["status"] = "unknown"
 
         except Exception as e:
             print(f"Error loading page for @{username}: {e!r}")
+            if not failure_reason:
+                failure_reason = f"{type(e).__name__}"
+            direct_failed = True
+            result["status"] = "unknown"
             try:
                 await browser.close()
             except Exception:
                 pass
-
-            try:
-                render_profile_card(
-                    username=username,
-                    output_path=output_path,
-                    status=result["status"],
-                )
-                result["image"] = output_path
-            except Exception:
-                result["image"] = None
-            return result
+            return result, direct_failed
 
         try:
             await browser.close()
@@ -293,8 +390,80 @@ async def check_instagram_account(username: str, output_path: str) -> dict:
             pass
 
     # -- Download avatar (outside browser context, using aiohttp) ---------------
-    if og_image:
-        result["avatar_bytes"] = await _download_avatar(og_image)
+    # Always skip the avatar download if this attempt was a transport failure,
+    # so we don't burn bandwidth fetching an image we're about to discard.
+    if og_image and not direct_failed:
+        result["avatar_bytes"] = await _download_avatar(og_image, use_proxy=use_proxy)
+
+    return result, direct_failed
+
+
+async def check_instagram_account(username: str, output_path: str) -> dict:
+    """
+    Returns a dict:
+      {
+        "status": "active" | "banned" | "unknown",
+        "image": path-or-None,
+        "followers": int-or-None,
+        "following": int-or-None,
+        "posts": int-or-None,
+        "full_name": str-or-None,
+        "bio": str-or-None,
+        "avatar_bytes": bytes-or-None,
+      }
+
+    Strategy: try Instagram DIRECTLY first. Only on transport-level failure
+    (timeout, 403/429, login wall, network error) do we retry via the proxy.
+    A successful direct attempt never touches the proxy -- this is the main
+    bandwidth saving. If a direct failure occurs, the username is cached
+    for 24h so the next check goes straight to proxy.
+    """
+    url = f"https://www.instagram.com/{username}/"
+
+    # Decide which path to take. If the cache says "this user needs proxy",
+    # skip the direct attempt entirely and save both time and bandwidth.
+    use_proxy_first = _should_use_proxy(username)
+    if use_proxy_first:
+        print(f"  [proxy] @{username} cached as needing proxy, skipping direct attempt")
+
+    result: dict | None = None
+    if not use_proxy_first:
+        try:
+            result, direct_failed = await _run_check(username, url, use_proxy=False)
+        except Exception as e:
+            print(f"  [proxy] @{username} direct attempt raised: {e!r}")
+            result, direct_failed = None, True
+
+        if result is not None and not direct_failed:
+            print(f"  [proxy] @{username} direct attempt succeeded, no proxy used")
+        elif not _proxy_config():
+            # No proxy configured at all -- nothing to fall back to. Return
+            # whatever we got (likely status='unknown') so caller can log it.
+            print(
+                f"  [proxy] @{username} direct attempt failed but no proxy "
+                f"is configured; returning result as-is"
+            )
+        else:
+            # Cache this user as needing proxy, then fall through to retry.
+            _mark_needs_proxy(username)
+            print(f"  [proxy] @{username} direct attempt failed; retrying via proxy")
+            result = None  # force proxy path below
+
+    if result is None:
+        try:
+            result, _ = await _run_check(username, url, use_proxy=True)
+        except Exception as e:
+            print(f"  [proxy] @{username} proxy attempt raised: {e!r}")
+            result = {
+                "status": "unknown",
+                "image": None,
+                "followers": None,
+                "following": None,
+                "posts": None,
+                "full_name": None,
+                "bio": None,
+                "avatar_bytes": None,
+            }
 
     # -- Render the profile card ------------------------------------------------
     try:
