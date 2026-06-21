@@ -136,13 +136,14 @@ async def check_instagram_account(username: str, output_path: str) -> dict:
     try:
         data = await _fetch_profile(username)
     except Exception as e:
+        # Any HTTP / network error from the API endpoint is NOT evidence that
+        # the Instagram account is banned. A 404 here is almost always a
+        # quota / auth / network problem on our side; a 200 with status:false
+        # is the real "banned / doesn't exist" signal (handled below).
+        # So all exception paths stay as "unknown" so we don't fire false
+        # "Recovered" / "Banned" notifications.
         print(f"  [api] error fetching @{username}: {e!r}")
-        # HTTP 404 from the API == account is banned / doesn't exist.
-        # Network / 5xx errors stay as "unknown".
-        if "HTTP 404" in str(e) or "HTTP 400" in str(e):
-            result["status"] = "banned"
-        else:
-            result["status"] = "unknown"
+        result["status"] = "unknown"
         try:
             render_profile_card(
                 username=username,

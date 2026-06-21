@@ -15,15 +15,13 @@ is automatically deactivated (the bot stops checking that specific watch
 after it notifies). "Time taken" is measured from when the watch was added
 (created_at) to the moment the condition is detected.
 
-NOTE on CHECK_INTERVAL_SECONDS: each check launches a real headless browser
-(needed for status detection), which typically takes a few seconds on its
-own -- so a 10-second interval is workable for one or two watched accounts,
-but checks run sequentially within each loop tick, so the real per-account
-cadence will fall noticeably behind the literal 10 seconds once you have
-several watches active at once. Instagram's anti-bot defenses have also
-gotten considerably more aggressive, and datacenter/VPS IPs get flagged
-faster than residential ones -- checking this often from a cloud host is
-the single biggest factor that could get the bot's IP rate-limited.
+NOTE on CHECK_INTERVAL_SECONDS: each check is now a single RapidAPI
+call (instagram-looter2.p.rapidapi.com) — no headless browser, no
+scraping Instagram directly. Checks within one loop tick run
+concurrently (CHECK_CONCURRENCY in flight at once), so a 200-account
+sweep finishes in tens of seconds, not minutes. The 10-second
+interval is fine for that. If you have a paid RapidAPI plan with a
+higher per-minute quota, bump CHECK_CONCURRENCY accordingly.
 """
 
 import asyncio
@@ -64,7 +62,17 @@ load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
 CHECK_INTERVAL_SECONDS = 10
-INTER_ACCOUNT_DELAY_SECONDS = 5  # gap between distinct accounts within one tick
+# No inter-account delay: we're now going through the RapidAPI endpoint
+# (instagram-looter2.p.rapidapi.com), not scraping Instagram directly, so
+# there's no anti-bot-rate-limit concern. Concurrency is bounded by
+# CHECK_CONCURRENCY below instead. The previous 5-second sleep made a
+# 200-account sweep take ~17 minutes and starved the event loop, so
+# slash commands stopped responding. Setting to 0 fixes that.
+INTER_ACCOUNT_DELAY_SECONDS = 0
+# How many Instagram checks run in parallel inside one periodic tick.
+# 8 is a safe ceiling for RapidAPI's free / Basic plans; bump higher
+# if you're on a paid plan with a larger per-minute quota.
+CHECK_CONCURRENCY = 8
 
 # Every N iterations (~N*10s), post a one-line "still watching" message to
 # the channel for each active watch. Gives the user visible proof the bot is
@@ -714,117 +722,129 @@ async def periodic_check():
         return
 
     print(
-        f"[iter {iter_id}] checking {len(watches)} watch(es): "
-        f"{[w['username'] for w in watches]}"
+        f"[iter {iter_id}] checking {len(watches)} watch(es) "
+        f"(concurrency={CHECK_CONCURRENCY})"
     )
 
-    for w in watches:
-        username = w["username"]
-        path = os.path.join(CARD_DIR, f"{username}_{w['id']}.png")
+    # Run all checks concurrently, bounded by a semaphore so we don't
+    # hammer the API. This is the fix for "bot doesn't respond in Discord":
+    # the previous sequential + 5s-sleep design held the event loop for
+    # ~17 minutes on a 200-account sweep, so slash commands never got a
+    # chance to respond. With CHECK_CONCURRENCY in flight at once, the
+    # same sweep finishes in ~30s and the event loop is free in between.
+    sem = asyncio.Semaphore(CHECK_CONCURRENCY)
+
+    async def _check_one(w: dict) -> None:
+        async with sem:
+            await _check_one_watch(w, iter_id)
+
+    await asyncio.gather(*[_check_one(w) for w in watches], return_exceptions=True)
+
+
+async def _check_one_watch(w: dict, iter_id: int) -> None:
+    """Run a single check for one watch: fetch status, optionally heartbeat,
+    fire the notification if the watched condition is met, deactivate."""
+    username = w["username"]
+    path = os.path.join(CARD_DIR, f"{username}_{w['id']}.png")
+    try:
+        info = await check_instagram_account(username, path)
+        _loop_stats["checks"] += 1
+    except Exception as e:
+        print(f"[iter {iter_id}] error checking @{username}: {e!r}")
+        _loop_stats["errors"] += 1
+        return
+
+    print(
+        f"[iter {iter_id}] @{username} -> status={info['status']} "
+        f"followers={info.get('followers')} watch_type={w['watch_type']}"
+    )
+
+    # Heartbeat: every N iterations, post a one-line "still watching"
+    # message to the channel so the user can see the bot is alive.
+    if iter_id % HEARTBEAT_EVERY_N_ITERATIONS == 0:
+        channel = await _resolve_channel(w["channel_id"], w.get("guild_id"))
+        if channel is None:
+            print(
+                f"[iter {iter_id}] heartbeat: channel {w['channel_id']} "
+                f"unreachable for @{username}; deleting watch"
+            )
+            await store.delete_watch(w["id"])
+            return
         try:
-            info = await check_instagram_account(username, path)
-            _loop_stats["checks"] += 1
+            emoji = {
+                "active": "✅",
+                "banned": "❌",
+                "unknown": "⚠️",
+            }.get(info["status"], "❔")
+            note = {
+                "active": "still active — I'll post when it changes",
+                "banned": "currently banned — I'll post when it recovers",
+                "unknown": "couldn't read its status this cycle",
+            }.get(info["status"], "status unknown")
+            await channel.send(
+                f"💓 Still watching **@{_esc(username)}** — {note} {emoji}"
+            )
+        except Exception:
+            pass
+
+    wants_banned = w["watch_type"] == "banned" and info["status"] == "banned"
+    wants_unbanned = w["watch_type"] == "unbanned" and info["status"] == "active"
+
+    if wants_banned or wants_unbanned:
+        if wants_unbanned:
+            title = f"Account Recovered | @{username} 🏆✅"
+        else:
+            title = f"Account Banned | @{username} 🔒🚫"
+
+        created_at = w.get("created_at", time.time())
+        elapsed = time.time() - created_at
+        embed = build_embed(title, username, info, elapsed_seconds=elapsed)
+        file = attach_card_image(embed, info)
+
+        # Notify the target channel (the #banned or #unban channel)
+        channel = await _resolve_channel(w["channel_id"], w.get("guild_id"))
+        if channel is None:
+            print(
+                f"[iter {iter_id}] channel {w['channel_id']} no longer "
+                f"accessible for @{username}; deleting watch. "
+                f"User must re-run the command in a valid channel."
+            )
+            await store.delete_watch(w["id"])
+            return
+
+        try:
+            if file:
+                await channel.send(content=f"<@{w['user_id']}>", embed=embed, file=file)
+            else:
+                await channel.send(content=f"<@{w['user_id']}>", embed=embed)
+            _loop_stats["fired"] += 1
+            print(
+                f"[iter {iter_id}] notified for @{username} "
+                f"({w['watch_type']}) in channel {w['channel_id']}"
+            )
+        except discord.Forbidden as e:
+            print(
+                f"[iter {iter_id}] permission denied sending to "
+                f"channel {w['channel_id']} for @{username}: {e!r}; "
+                f"deleting watch"
+            )
+            await store.delete_watch(w["id"])
+        except discord.NotFound as e:
+            print(
+                f"[iter {iter_id}] channel {w['channel_id']} deleted "
+                f"for @{username}: {e!r}; deleting watch"
+            )
+            await store.delete_watch(w["id"])
         except Exception as e:
-            print(f"[iter {iter_id}] error checking @{username}: {e!r}")
-            _loop_stats["errors"] += 1
-            continue
-
-        print(
-            f"[iter {iter_id}] @{username} -> status={info['status']} "
-            f"followers={info.get('followers')} watch_type={w['watch_type']}"
-        )
-
-        # Heartbeat: every N iterations, post a one-line "still watching"
-        # message to the channel so the user can see the bot is alive.
-        if iter_id % HEARTBEAT_EVERY_N_ITERATIONS == 0:
-            channel = await _resolve_channel(w["channel_id"], w.get("guild_id"))
-            if channel is None:
-                print(
-                    f"[iter {iter_id}] heartbeat: channel {w['channel_id']} "
-                    f"unreachable for @{username}; deleting watch"
-                )
-                await store.delete_watch(w["id"])
-                continue
-            try:
-                emoji = {
-                    "active": "✅",
-                    "banned": "❌",
-                    "unknown": "⚠️",
-                }.get(info["status"], "❔")
-                note = {
-                    "active": "still active — I'll post when it changes",
-                    "banned": "currently banned — I'll post when it recovers",
-                    "unknown": "couldn't read its status this cycle",
-                }.get(info["status"], "status unknown")
-                await channel.send(
-                    f"💓 Still watching **@{_esc(username)}** — {note} {emoji}"
-                )
-            except Exception:
-                pass
-
-        wants_banned = w["watch_type"] == "banned" and info["status"] == "banned"
-        wants_unbanned = w["watch_type"] == "unbanned" and info["status"] == "active"
-
-        if wants_banned or wants_unbanned:
-            if wants_unbanned:
-                title = f"Account Recovered | @{username} 🏆✅"
-            else:
-                title = f"Account Banned | @{username} 🔒🚫"
-
-            created_at = w.get("created_at", time.time())
-            elapsed = time.time() - created_at
-            embed = build_embed(title, username, info, elapsed_seconds=elapsed)
-            file = attach_card_image(embed, info)
-
-            # Notify the target channel (the #banned or #unban channel)
-            channel = await _resolve_channel(w["channel_id"], w.get("guild_id"))
-            if channel is None:
-                print(
-                    f"[iter {iter_id}] channel {w['channel_id']} no longer "
-                    f"accessible for @{username}; deleting watch. "
-                    f"User must re-run the command in a valid channel."
-                )
-                await store.delete_watch(w["id"])
-                continue
-
-            try:
-                if file:
-                    await channel.send(
-                        content=f"<@{w['user_id']}>", embed=embed, file=file
-                    )
-                else:
-                    await channel.send(content=f"<@{w['user_id']}>", embed=embed)
-                _loop_stats["fired"] += 1
-                print(
-                    f"[iter {iter_id}] notified for @{username} "
-                    f"({w['watch_type']}) in channel {w['channel_id']}"
-                )
-            except discord.Forbidden as e:
-                print(
-                    f"[iter {iter_id}] permission denied sending to "
-                    f"channel {w['channel_id']} for @{username}: {e!r}; "
-                    f"deleting watch"
-                )
-                await store.delete_watch(w["id"])
-            except discord.NotFound as e:
-                print(
-                    f"[iter {iter_id}] channel {w['channel_id']} deleted "
-                    f"for @{username}: {e!r}; deleting watch"
-                )
-                await store.delete_watch(w["id"])
-            except Exception as e:
-                print(
-                    f"[iter {iter_id}] failed to send notification for "
-                    f"@{username}: {e!r}; deleting watch"
-                )
-                await store.delete_watch(w["id"])
-            else:
-                # Notification sent successfully -- deactivate so it
-                # doesn't fire again.
-                await store.deactivate(w["id"])
-
-        if len(watches) > 1:
-            await asyncio.sleep(INTER_ACCOUNT_DELAY_SECONDS)
+            print(
+                f"[iter {iter_id}] failed to send notification for "
+                f"@{username}: {e!r}; deleting watch"
+            )
+            await store.delete_watch(w["id"])
+        else:
+            # Notification sent successfully -- deactivate so it
+            # doesn't fire again.
+            await store.deactivate(w["id"])
 
 
 @periodic_check.before_loop
