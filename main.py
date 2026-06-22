@@ -7,21 +7,33 @@ Commands (work as both slash commands and !prefix commands):
   checkstatus <username>    - check the live status right now
   list                      - list accounts currently being watched
   stopall                   - stop all active watches in this server
+  botstatus                 - show cache stats and loop diagnostics
 
-A background task runs on a short interval (see CHECK_INTERVAL_SECONDS
-below), checks every active watch, and posts an embed with a rendered
-profile card the moment a watched condition is met. Once a watch fires, it
-is automatically deactivated (the bot stops checking that specific watch
-after it notifies). "Time taken" is measured from when the watch was added
-(created_at) to the moment the condition is detected.
+Polling architecture:
+  The loop ticks every CHECK_INTERVAL_SECONDS (60s), but individual accounts
+  are only checked based on their last known status (tiered frequency):
+    - Active accounts  → every 5 min  (bans are rare, no need to poll hard)
+    - Banned accounts  → every 1 min  (user wants fast unban detection)
+    - Unknown accounts → every 2 min  (retry cadence)
 
-NOTE on CHECK_INTERVAL_SECONDS: each check is now a single RapidAPI
-call (instagram-looter2.p.rapidapi.com) — no headless browser, no
-scraping Instagram directly. Checks within one loop tick run
-concurrently (CHECK_CONCURRENCY in flight at once), so a 200-account
-sweep finishes in tens of seconds, not minutes. The 10-second
-interval is fine for that. If you have a paid RapidAPI plan with a
-higher per-minute quota, bump CHECK_CONCURRENCY accordingly.
+  This cuts API calls by ~87% vs checking all accounts every tick.
+
+  Each check calls Instagram's own GraphQL API
+  (i.instagram.com/api/v1/users/web_profile_info/) — no RapidAPI, no API
+  key, no monthly quota. This is the same endpoint Instagram's web frontend
+  uses, and it's free and unauthenticated.
+
+  For each account:
+    - HTTP 200 + JSON → status="active", full profile data available
+    - HTTP 404       → status="banned" (account gone)
+    - HTTP 429/401   → status="rate_limited" (pause + alert)
+
+  A persistent status_cache.json tracks the last status + profile signature
+  per username. If both are unchanged, the card PNG render is skipped.
+  Notifications only fire on actual status transitions (active↔banned).
+
+  If Instagram 429s the sweep (per-IP rate limit), the loop pauses for 5 min
+  and posts an alert. Set PROXY_URLS in .env to rotate across egress IPs.
 """
 
 import asyncio
@@ -49,6 +61,7 @@ except Exception as _cert_err:
 
 from card_renderer import render_profile_card
 from instagram_checker import check_instagram_account
+from status_cache import StatusCache
 from storage import WatchStore
 
 ESC = str.maketrans({"_": r"\_"})
@@ -61,26 +74,46 @@ def _esc(username: str) -> str:
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-CHECK_INTERVAL_SECONDS = 10
-# No inter-account delay: we're now going through the RapidAPI endpoint
-# (instagram-looter2.p.rapidapi.com), not scraping Instagram directly, so
-# there's no anti-bot-rate-limit concern. Concurrency is bounded by
-# CHECK_CONCURRENCY below instead. The previous 5-second sleep made a
-# 200-account sweep take ~17 minutes and starved the event loop, so
-# slash commands stopped responding. Setting to 0 fixes that.
-INTER_ACCOUNT_DELAY_SECONDS = 0
-# How many Instagram checks run in parallel inside one periodic tick.
-# 8 is a safe ceiling for RapidAPI's free / Basic plans; bump higher
-# if you're on a paid plan with a larger per-minute quota.
+# Polling interval (seconds). The loop ticks every 60s, but individual
+# accounts are only checked based on their tier interval below (not every
+# tick). This dramatically reduces API calls — active accounts are only
+# checked every 5 min, banned every 1 min, etc.
+CHECK_INTERVAL_SECONDS = 60
+
+# How many accounts to fetch in parallel inside one tick.
+# 8 is safe from one IP without triggering Instagram's soft rate limit.
+# If you consistently get rate_limited, lower this to 4 or add proxies.
 CHECK_CONCURRENCY = 8
 
-# Every N iterations (~N*10s), post a one-line "still watching" message to
-# the channel for each active watch. Gives the user visible proof the bot is
-# alive and checking, and surfaces the current status of the watched account.
-HEARTBEAT_EVERY_N_ITERATIONS = 30  # ~5 minutes at 10s interval
+# Status-based check frequency (seconds since last_checked).
+# Active accounts are checked less often (bans are rare events).
+# Banned accounts are checked more often (user wants fast unban detection).
+# Unknown accounts retry at a medium cadence.
+TIER_INTERVALS = {
+    "active": 300,  # 5 minutes
+    "banned": 60,  # 1 minute
+    "unknown": 120,  # 2 minutes
+    None: 60,  # default for never-checked accounts
+}
+
+# Post a single aggregate heartbeat to the alert channel every N ticks.
+# 5 ticks × 60s = 5 minutes.
+HEARTBEAT_EVERY_N_ITERATIONS = 5
+
+# Optional: channel ID for alerts (rate-limit, aggregate heartbeat).
+# Falls back to the first guild's system channel.
+ALERT_CHANNEL_ID = os.getenv("ALERT_CHANNEL_ID")
 
 _loop_iteration = 0
-_loop_stats = {"runs": 0, "checks": 0, "errors": 0, "fired": 0}
+_loop_stats = {
+    "runs": 0,
+    "checks": 0,
+    "errors": 0,
+    "fired": 0,
+    "cache_hits": 0,
+    "cache_misses": 0,
+    "last_sweep_duration": 0.0,
+}
 
 CARD_DIR = "cards"
 os.makedirs(CARD_DIR, exist_ok=True)
@@ -90,6 +123,7 @@ intents.message_content = True  # needed for classic !prefix commands
 
 bot = commands.Bot(command_prefix="!", intents=intents)
 store = WatchStore("watchlist.json")
+status_cache = StatusCache("status_cache.json")
 
 
 # ---------------------------------------------------------------------------
@@ -272,6 +306,36 @@ def _explain_no_permission(channel) -> str:
     return "Make sure I have the `Send Messages` permission in this channel."
 
 
+async def _resolve_alert_channel():
+    """Find the channel for alerts + aggregate heartbeat.
+    Tries ALERT_CHANNEL_ID from env, then falls back to the first guild's
+    system channel."""
+    if ALERT_CHANNEL_ID:
+        try:
+            ch = await _resolve_channel(int(ALERT_CHANNEL_ID))
+            if ch is not None:
+                return ch
+        except Exception:
+            pass
+    if bot.guilds:
+        guild = bot.guilds[0]
+        if guild.system_channel:
+            return guild.system_channel
+    return None
+
+
+async def _send_alert(message: str) -> None:
+    """Send a one-line alert to the alert channel. Best-effort, never raises."""
+    channel = await _resolve_alert_channel()
+    if channel is None:
+        print(f"[alert] no channel available: {message}")
+        return
+    try:
+        await channel.send(message)
+    except Exception as e:
+        print(f"[alert] failed to send: {e!r}")
+
+
 def build_embed(
     title: str, username: str, info: dict, elapsed_seconds: float | None = None
 ) -> discord.Embed:
@@ -337,6 +401,13 @@ async def on_ready():
         print(f"Started periodic_check loop (every {CHECK_INTERVAL_SECONDS}s)")
     else:
         print("periodic_check loop already running")
+
+    # Print cache status at startup
+    try:
+        cache_all = await status_cache.get_all()
+        print(f"  Status cache: {len(cache_all)} cached account(s)")
+    except Exception as e:
+        print(f"  Status check failed: {e!r}")
 
 
 def _guild_id(ctx):
@@ -528,29 +599,36 @@ async def checkstatus(
         )
         return
 
-    for uname in usernames:
-        path = os.path.join(CARD_DIR, f"status_{uname}.png")
-        try:
-            info = await check_instagram_account(uname, path)
-        except Exception as e:
-            await _reply(ctx, f"❌ Error checking @{_esc(uname)}: {e!r}")
+    title_map = {
+        "active": "Account Active | @{u} ✅",
+        "banned": "Account Banned | @{u} ❌",
+        "rate_limited": "Rate Limited | @{u} ⏸️",
+        "unknown": "Status Unknown | @{u} ⚠️",
+    }
+
+    sem = asyncio.Semaphore(CHECK_CONCURRENCY)
+
+    async def _check_one_status(uname: str):
+        async with sem:
+            path = os.path.join(CARD_DIR, f"status_{uname}.png")
+            try:
+                return await check_instagram_account(uname, path)
+            except Exception as e:
+                return {"status": "unknown", "_error": repr(e), "image": None}
+
+    results = await asyncio.gather(*[_check_one_status(u) for u in usernames])
+
+    for uname, info in zip(usernames, results):
+        if "_error" in info:
+            await _reply(ctx, f"❌ Error checking @{_esc(uname)}: {info['_error']}")
             continue
-
-        title_map = {
-            "active": f"Account Active | @{uname} ✅",
-            "banned": f"Account Banned | @{uname} ❌",
-            "unknown": f"Status Unknown | @{uname} ⚠️",
-        }
-        embed = build_embed(title_map[info["status"]], uname, info)
+        title_tmpl = title_map.get(info["status"], "Status Unknown | @{u} ⚠️")
+        embed = build_embed(title_tmpl.format(u=uname), uname, info)
         file = attach_card_image(embed, info)
-
         if file:
             await _reply(ctx, embed=embed, file=file)
         else:
             await _reply(ctx, embed=embed)
-
-        if len(usernames) > 1:
-            await asyncio.sleep(1)
 
     if len(usernames) > 1:
         await _reply(ctx, f"✅ Checked {len(usernames)} accounts.")
@@ -611,7 +689,7 @@ async def stopall(ctx: commands.Context):
 
 @bot.hybrid_command(
     name="botstatus",
-    description="Show internal bot stats: loop runs, errors, last fire time.",
+    description="Show cache stats and loop diagnostics.",
 )
 async def botstatus(ctx: commands.Context):
     await _defer(ctx)
@@ -622,13 +700,37 @@ async def botstatus(ctx: commands.Context):
     else:
         next_str = "n/a"
     stats = _loop_stats
+    cache_all = await status_cache.get_all()
+
+    # Count accounts by tier
+    tier_counts = {"active": 0, "banned": 0, "unknown": 0, "never": 0}
+    for entry in cache_all.values():
+        status = entry.get("confirmed")
+        if status in tier_counts:
+            tier_counts[status] += 1
+        else:
+            tier_counts["unknown"] += 1
+
+    total = stats["cache_hits"] + stats["cache_misses"]
+    hit_rate = f"{stats['cache_hits'] / total * 100:.1f}%" if total > 0 else "n/a"
     msg = (
         f"**Bot diagnostics**\n"
         f"• Loop running: `{is_running}`\n"
-        f"• Check interval: `{CHECK_INTERVAL_SECONDS}s`\n"
+        f"• Loop tick: `{CHECK_INTERVAL_SECONDS}s`\n"
+        f"• Concurrency: `{CHECK_CONCURRENCY}`\n"
         f"• Next iteration: {next_str}\n"
-        f"• Total loop runs: `{stats['runs']}`\n"
-        f"• Successful checks: `{stats['checks']}`\n"
+        f"• Last sweep duration: `{stats['last_sweep_duration']:.1f}s`\n"
+        f"\n**Tier schedule**\n"
+        f"• Active (5 min): `{tier_counts['active']}` account(s)\n"
+        f"• Banned (1 min): `{tier_counts['banned']}` account(s)\n"
+        f"• Unknown (2 min): `{tier_counts['unknown']}` account(s)\n"
+        f"• Never checked: `{tier_counts['never']}` account(s)\n"
+        f"\n**Cache**\n"
+        f"• Cached accounts: `{len(cache_all)}`\n"
+        f"• Card-render hit rate: `{hit_rate}` ({stats['cache_hits']} hits / {stats['cache_misses']} misses)\n"
+        f"\n**Loop stats**\n"
+        f"• Total runs: `{stats['runs']}`\n"
+        f"• API checks: `{stats['checks']}`\n"
         f"• Errors: `{stats['errors']}`\n"
         f"• Notifications fired: `{stats['fired']}`"
     )
@@ -704,147 +806,215 @@ async def forcecheck(ctx: commands.Context):
 
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
 async def periodic_check():
+    """Fetch due accounts via Instagram's free GraphQL API.
+    Accounts are checked on a tiered schedule based on their last known
+    status (active=5min, banned=1min, unknown=2min). Skip card render for
+    unchanged accounts. Notify on status transitions."""
     global _loop_iteration
     _loop_iteration += 1
     _loop_stats["runs"] += 1
     iter_id = _loop_iteration
 
     try:
-        watches = await store.get_active_watches()
+        grouped = await store.get_active_watches_grouped_by_username()
     except Exception as e:
         print(f"[iter {iter_id}] failed to load watches: {e!r}")
         _loop_stats["errors"] += 1
         return
 
-    if not watches:
+    if not grouped:
         if iter_id == 1 or iter_id % 30 == 0:
             print(f"[iter {iter_id}] no active watches")
         return
 
-    print(
-        f"[iter {iter_id}] checking {len(watches)} watch(es) "
-        f"(concurrency={CHECK_CONCURRENCY})"
-    )
+    all_usernames = list(grouped.keys())
+    total_watches = sum(len(ws) for ws in grouped.values())
 
-    # Run all checks concurrently, bounded by a semaphore so we don't
-    # hammer the API. This is the fix for "bot doesn't respond in Discord":
-    # the previous sequential + 5s-sleep design held the event loop for
-    # ~17 minutes on a 200-account sweep, so slash commands never got a
-    # chance to respond. With CHECK_CONCURRENCY in flight at once, the
-    # same sweep finishes in ~30s and the event loop is free in between.
-    sem = asyncio.Semaphore(CHECK_CONCURRENCY)
+    # Filter to only accounts that are due for their tier
+    due_usernames = await status_cache.get_due_usernames(all_usernames, TIER_INTERVALS)
+    skipped = len(all_usernames) - len(due_usernames)
 
-    async def _check_one(w: dict) -> None:
-        async with sem:
-            await _check_one_watch(w, iter_id)
-
-    await asyncio.gather(*[_check_one(w) for w in watches], return_exceptions=True)
-
-
-async def _check_one_watch(w: dict, iter_id: int) -> None:
-    """Run a single check for one watch: fetch status, optionally heartbeat,
-    fire the notification if the watched condition is met, deactivate."""
-    username = w["username"]
-    path = os.path.join(CARD_DIR, f"{username}_{w['id']}.png")
-    try:
-        info = await check_instagram_account(username, path)
-        _loop_stats["checks"] += 1
-    except Exception as e:
-        print(f"[iter {iter_id}] error checking @{username}: {e!r}")
-        _loop_stats["errors"] += 1
+    if not due_usernames:
+        if iter_id % 10 == 0:
+            print(
+                f"[iter {iter_id}] {len(all_usernames)} account(s), "
+                f"0 due this tick ({skipped} skipped by tier)"
+            )
+        # Still send heartbeat
+        if iter_id % HEARTBEAT_EVERY_N_ITERATIONS == 0:
+            await _send_alert(
+                f"💓 Watching {len(all_usernames)} account(s) · "
+                f"0 due this tick · {skipped} skipped by tier schedule"
+            )
         return
 
     print(
-        f"[iter {iter_id}] @{username} -> status={info['status']} "
-        f"followers={info.get('followers')} watch_type={w['watch_type']}"
+        f"[iter {iter_id}] {len(all_usernames)} account(s), "
+        f"{len(due_usernames)} due ({skipped} skipped by tier) "
+        f"for {total_watches} watch(es)"
     )
 
-    # Heartbeat: every N iterations, post a one-line "still watching"
-    # message to the channel so the user can see the bot is alive.
+    sweep_start = time.time()
+    sem = asyncio.Semaphore(CHECK_CONCURRENCY)
+    # results: username_lower -> (prev_status, new_status, info)
+    results: dict[str, tuple[str | None, str | None, dict | None]] = {}
+    iter_cache_hits = 0
+    iter_cache_misses = 0
+    rate_limited = False
+
+    async def _check_one(username_lower: str) -> None:
+        nonlocal iter_cache_hits, iter_cache_misses, rate_limited
+        orig = grouped[username_lower][0]["username"]
+        cached = await status_cache.get(username_lower)
+        cached_sig = cached.get("profile_sig") if cached else None
+        prev_status = cached.get("confirmed") if cached else None
+
+        async with sem:
+            path = os.path.join(CARD_DIR, f"{orig}.png")
+            try:
+                info = await check_instagram_account(orig, path, cached_sig=cached_sig)
+                _loop_stats["checks"] += 1
+            except Exception as e:
+                print(f"[iter {iter_id}] error checking @{orig}: {e!r}")
+                _loop_stats["errors"] += 1
+                results[username_lower] = (prev_status, None, None)
+                return
+
+        status = info["status"]
+
+        if status == "rate_limited":
+            rate_limited = True
+            results[username_lower] = (prev_status, None, None)
+            return
+
+        if status not in ("active", "banned"):
+            results[username_lower] = (prev_status, None, None)
+            return
+
+        if (
+            prev_status == status
+            and info.get("profile_sig")
+            and cached_sig
+            and info["profile_sig"] == cached_sig
+        ):
+            iter_cache_hits += 1
+        else:
+            iter_cache_misses += 1
+            if prev_status != status:
+                print(
+                    f"[iter {iter_id}] @{orig} status transition: "
+                    f"{prev_status} -> {status}"
+                )
+
+        await status_cache.set(
+            username_lower,
+            {
+                "confirmed": status,
+                "last_checked": time.time(),
+                "last_seen": time.time(),
+                "profile_sig": info.get("profile_sig"),
+                "avatar_url": info.get("avatar_url"),
+            },
+        )
+        results[username_lower] = (prev_status, status, info)
+
+    await asyncio.gather(
+        *[_check_one(u) for u in due_usernames], return_exceptions=True
+    )
+
+    _loop_stats["last_sweep_duration"] = time.time() - sweep_start
+    _loop_stats["cache_hits"] += iter_cache_hits
+    _loop_stats["cache_misses"] += iter_cache_misses
+
+    if rate_limited:
+        print(f"[iter {iter_id}] Instagram rate-limited; pausing 5 min")
+        _loop_stats["errors"] += 1
+        await _send_alert(
+            "⚠️ Instagram rate-limited the sweep (soft IP block). Pausing 5 min. "
+            "Consider lowering CHECK_CONCURRENCY, increasing CHECK_INTERVAL_SECONDS, "
+            "or adding proxies via PROXY_URLS in .env."
+        )
+        await asyncio.sleep(300)
+        return
+
+    # Fan-out notifications: only on status transitions
+    for username_lower, (prev_status, new_status, info) in results.items():
+        if new_status is None or info is None:
+            continue
+        for w in grouped.get(username_lower, []):
+            wants_banned = w["watch_type"] == "banned" and new_status == "banned"
+            wants_unbanned = w["watch_type"] == "unbanned" and new_status == "active"
+            if not (wants_banned or wants_unbanned):
+                continue
+            # Skip if status unchanged from previous check (already notified)
+            if prev_status == new_status:
+                continue
+            await _notify_watch(w, new_status, info, iter_id)
+
+    # Aggregate heartbeat to alert channel
     if iter_id % HEARTBEAT_EVERY_N_ITERATIONS == 0:
-        channel = await _resolve_channel(w["channel_id"], w.get("guild_id"))
-        if channel is None:
-            print(
-                f"[iter {iter_id}] heartbeat: channel {w['channel_id']} "
-                f"unreachable for @{username}; deleting watch"
-            )
-            await store.delete_watch(w["id"])
-            return
-        try:
-            emoji = {
-                "active": "✅",
-                "banned": "❌",
-                "unknown": "⚠️",
-            }.get(info["status"], "❔")
-            note = {
-                "active": "still active — I'll post when it changes",
-                "banned": "currently banned — I'll post when it recovers",
-                "unknown": "couldn't read its status this cycle",
-            }.get(info["status"], "status unknown")
-            await channel.send(
-                f"💓 Still watching **@{_esc(username)}** — {note} {emoji}"
-            )
-        except Exception:
-            pass
+        sweep_s = _loop_stats["last_sweep_duration"]
+        total_cache = iter_cache_hits + iter_cache_misses
+        hit_pct = (
+            f"{iter_cache_hits / total_cache * 100:.0f}%" if total_cache > 0 else "n/a"
+        )
+        await _send_alert(
+            f"💓 Watching {len(all_usernames)} account(s) · "
+            f"{len(due_usernames)} checked, {skipped} skipped · "
+            f"sweep {sweep_s:.1f}s · "
+            f"card cache {hit_pct}"
+        )
 
-    wants_banned = w["watch_type"] == "banned" and info["status"] == "banned"
-    wants_unbanned = w["watch_type"] == "unbanned" and info["status"] == "active"
 
-    if wants_banned or wants_unbanned:
-        if wants_unbanned:
-            title = f"Account Recovered | @{username} 🏆✅"
+async def _notify_watch(w: dict, confirmed: str, info: dict, iter_id: int) -> None:
+    """Send a ban/unban notification for a single watch and deactivate it."""
+    username = w["username"]
+    if confirmed == "active":
+        title = f"Account Recovered | @{username} 🏆✅"
+    else:
+        title = f"Account Banned | @{username} 🔒🚫"
+
+    created_at = w.get("created_at", time.time())
+    elapsed = time.time() - created_at
+    embed = build_embed(title, username, info, elapsed_seconds=elapsed)
+    file = attach_card_image(embed, info)
+
+    channel = await _resolve_channel(w["channel_id"], w.get("guild_id"))
+    if channel is None:
+        print(
+            f"[iter {iter_id}] channel {w['channel_id']} gone for "
+            f"@{username}; deleting watch"
+        )
+        await store.delete_watch(w["id"])
+        return
+
+    try:
+        if file:
+            await channel.send(content=f"<@{w['user_id']}>", embed=embed, file=file)
         else:
-            title = f"Account Banned | @{username} 🔒🚫"
-
-        created_at = w.get("created_at", time.time())
-        elapsed = time.time() - created_at
-        embed = build_embed(title, username, info, elapsed_seconds=elapsed)
-        file = attach_card_image(embed, info)
-
-        # Notify the target channel (the #banned or #unban channel)
-        channel = await _resolve_channel(w["channel_id"], w.get("guild_id"))
-        if channel is None:
-            print(
-                f"[iter {iter_id}] channel {w['channel_id']} no longer "
-                f"accessible for @{username}; deleting watch. "
-                f"User must re-run the command in a valid channel."
-            )
-            await store.delete_watch(w["id"])
-            return
-
-        try:
-            if file:
-                await channel.send(content=f"<@{w['user_id']}>", embed=embed, file=file)
-            else:
-                await channel.send(content=f"<@{w['user_id']}>", embed=embed)
-            _loop_stats["fired"] += 1
-            print(
-                f"[iter {iter_id}] notified for @{username} "
-                f"({w['watch_type']}) in channel {w['channel_id']}"
-            )
-        except discord.Forbidden as e:
-            print(
-                f"[iter {iter_id}] permission denied sending to "
-                f"channel {w['channel_id']} for @{username}: {e!r}; "
-                f"deleting watch"
-            )
-            await store.delete_watch(w["id"])
-        except discord.NotFound as e:
-            print(
-                f"[iter {iter_id}] channel {w['channel_id']} deleted "
-                f"for @{username}: {e!r}; deleting watch"
-            )
-            await store.delete_watch(w["id"])
-        except Exception as e:
-            print(
-                f"[iter {iter_id}] failed to send notification for "
-                f"@{username}: {e!r}; deleting watch"
-            )
-            await store.delete_watch(w["id"])
-        else:
-            # Notification sent successfully -- deactivate so it
-            # doesn't fire again.
-            await store.deactivate(w["id"])
+            await channel.send(content=f"<@{w['user_id']}>", embed=embed)
+        _loop_stats["fired"] += 1
+        print(
+            f"[iter {iter_id}] notified for @{username} "
+            f"({w['watch_type']}) in {w['channel_id']}"
+        )
+    except discord.Forbidden:
+        print(
+            f"[iter {iter_id}] forbidden in {w['channel_id']} for "
+            f"@{username}; deleting watch"
+        )
+        await store.delete_watch(w["id"])
+    except discord.NotFound:
+        print(
+            f"[iter {iter_id}] channel {w['channel_id']} deleted for "
+            f"@{username}; deleting watch"
+        )
+        await store.delete_watch(w["id"])
+    except Exception as e:
+        print(f"[iter {iter_id}] send failed for @{username}: {e!r}; deleting watch")
+        await store.delete_watch(w["id"])
+    else:
+        await store.deactivate(w["id"])
 
 
 @periodic_check.before_loop

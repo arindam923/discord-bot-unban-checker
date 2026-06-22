@@ -1,35 +1,39 @@
 """
-Looks up Instagram profile data via the instagram-looter2.p.rapidapi.com API
-and renders a styled profile card image.
+Fetches Instagram profile data directly from Instagram's own GraphQL API.
 
-This replaces the previous Playwright + residential-proxy approach. A single
-REST call to RapidAPI returns everything we need (full_name, follower /
-following / post counts, bio, profile picture URL) without launching a
-browser, without scraping Instagram directly, and without burning proxy
-bandwidth.
+NO RapidAPI. NO API key. NO quota. NO monthly limit.
 
-The avatar is then downloaded from the CDN URL using aiohttp and passed to
-card_renderer.render_profile_card to produce the final PNG.
+Endpoint: i.instagram.com/api/v1/users/web_profile_info/?username=<u>
+Headers:  X-IG-App-ID (Instagram's public web app ID), User-Agent, Referer
+
+This is the same endpoint Instagram's own web frontend calls when you open
+a profile page. It's free, unauthenticated, and returns full profile JSON
+(followers, following, posts, bio, avatar URL) for active accounts, and
+HTTP 404 for banned/deleted/nonexistent accounts.
 
 Status detection:
-  - "active" -- API returned status=true with a real profile
-  - "banned" -- API returned status=false (account doesn't exist / banned)
-  - "unknown" -- network / 4xx / 5xx error (caller can log and retry later)
+  - "active"       -- HTTP 200 + JSON with user data
+  - "banned"       -- HTTP 404 (account doesn't exist / banned / deleted)
+  - "rate_limited" -- HTTP 429 (per-IP rate limit; needs proxies or slower interval)
+  - "unknown"      -- network error, non-JSON response, parse failure
+
+A shared aiohttp.ClientSession is used for connection pooling. In-memory
+avatar cache keyed by CDN URL avoids re-downloading the same avatar. Card
+render is skipped when the profile signature is unchanged from cache.
 """
 
+import json
 import os
 import ssl
+import time
 
 import aiohttp
 from dotenv import load_dotenv
 
 from card_renderer import render_profile_card
+from status_cache import compute_profile_sig
 
 load_dotenv()
-
-RAPIDAPI_HOST = os.getenv("RAPIDAPI_HOST", "instagram-looter2.p.rapidapi.com")
-RAPIDAPI_KEY = os.getenv("RAPIDAPI_KEY")
-RAPIDAPI_URL = f"https://{RAPIDAPI_HOST}/profile"
 
 try:
     import certifi
@@ -43,76 +47,73 @@ USER_AGENT = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
+# Instagram's public web app ID. This is embedded in Instagram's own JS
+# bundle and is used by their web frontend for unauthenticated GraphQL calls.
+# It is NOT a secret and is not tied to any account or quota.
+IG_APP_ID = "936619743392459"
+
+GRAPHQL_URL = "https://i.instagram.com/api/v1/users/web_profile_info/"
+
+# Shared session for connection pooling (lazy-init, lives for bot lifetime)
+_session: aiohttp.ClientSession | None = None
+
+# In-memory avatar cache: url -> bytes (or None if download failed).
+_avatar_url_cache: dict[str, bytes | None] = {}
+
+
+async def _get_session() -> aiohttp.ClientSession:
+    global _session
+    if _session is None or _session.closed:
+        connector = aiohttp.TCPConnector(limit=0, limit_per_host=0, ssl=_AIOHTTP_SSL)
+        _session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=15),
+            connector=connector,
+            headers={
+                "User-Agent": USER_AGENT,
+                "X-IG-App-ID": IG_APP_ID,
+                "Accept": "*/*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Referer": "https://www.instagram.com/",
+            },
+        )
+    return _session
+
 
 async def _download_avatar(url: str) -> bytes | None:
     if not url:
         return None
-    for ssl_ctx in (_AIOHTTP_SSL, None):
-        try:
-            kwargs = dict(
-                timeout=aiohttp.ClientTimeout(total=10),
-                headers={"User-Agent": USER_AGENT},
-            )
-            if ssl_ctx is not None:
-                kwargs["ssl"] = ssl_ctx
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, **kwargs) as resp:
-                    if resp.status == 200:
-                        data = await resp.read()
-                        if data and len(data) > 100:
-                            return data
-        except Exception:
-            continue
+    if url in _avatar_url_cache:
+        return _avatar_url_cache[url]
+    try:
+        session = await _get_session()
+        async with session.get(
+            url,
+            headers={"User-Agent": USER_AGENT},
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status == 200:
+                data = await resp.read()
+                if data and len(data) > 100:
+                    _avatar_url_cache[url] = data
+                    return data
+    except Exception:
+        pass
+    _avatar_url_cache[url] = None
     return None
 
 
-async def _fetch_profile(username: str) -> dict:
-    """Call the RapidAPI endpoint and return its raw JSON body."""
-    if not RAPIDAPI_KEY:
-        raise RuntimeError(
-            "RAPIDAPI_KEY is not set. Copy .env.example to .env and fill it in."
-        )
-    headers = {
-        "Content-Type": "application/json",
-        "x-rapidapi-host": RAPIDAPI_HOST,
-        "x-rapidapi-key": RAPIDAPI_KEY,
-        "User-Agent": USER_AGENT,
-    }
-    params = {"username": username}
-    last_err: Exception | None = None
-    for ssl_ctx in (_AIOHTTP_SSL, None):
-        try:
-            kwargs = dict(
-                timeout=aiohttp.ClientTimeout(total=15),
-                headers=headers,
-                params=params,
-            )
-            if ssl_ctx is not None:
-                kwargs["ssl"] = ssl_ctx
-            async with aiohttp.ClientSession() as session:
-                async with session.get(RAPIDAPI_URL, **kwargs) as resp:
-                    text = await resp.text()
-                    if resp.status == 200:
-                        import json
-
-                        return json.loads(text)
-                    # 4xx -- API key wrong, account not found, quota hit, etc.
-                    # Treat as "banned" candidate (the API often returns 404
-                    # for missing / banned accounts on this endpoint).
-                    raise RuntimeError(
-                        f"RapidAPI returned HTTP {resp.status}: {text[:200]}"
-                    )
-        except Exception as e:
-            last_err = e
-            continue
-    raise RuntimeError(f"RapidAPI request failed: {last_err!r}")
-
-
-async def check_instagram_account(username: str, output_path: str) -> dict:
+async def check_instagram_account(
+    username: str, output_path: str, cached_sig: str | None = None
+) -> dict:
     """
+    Fetch profile status + data from Instagram's GraphQL API.
+
+    If cached_sig matches the newly computed profile signature AND the PNG
+    already exists, the card render is skipped (byte-identical output).
+
     Returns a dict:
       {
-        "status": "active" | "banned" | "unknown",
+        "status": "active" | "banned" | "rate_limited" | "unknown",
         "image": path-or-None,
         "followers": int-or-None,
         "following": int-or-None,
@@ -120,6 +121,8 @@ async def check_instagram_account(username: str, output_path: str) -> dict:
         "full_name": str-or-None,
         "bio": str-or-None,
         "avatar_bytes": bytes-or-None,
+        "avatar_url": str-or-None,
+        "profile_sig": str-or-None,
       }
     """
     result = {
@@ -131,65 +134,119 @@ async def check_instagram_account(username: str, output_path: str) -> dict:
         "full_name": None,
         "bio": None,
         "avatar_bytes": None,
+        "avatar_url": None,
+        "profile_sig": None,
     }
 
     try:
-        data = await _fetch_profile(username)
+        session = await _get_session()
+        async with session.get(
+            GRAPHQL_URL,
+            params={"username": username},
+        ) as resp:
+            if resp.status == 429:
+                result["status"] = "rate_limited"
+                return result
+
+            # Instagram returns 401 with "require_login" when the IP is
+            # temporarily rate-limited (soft block). Treat same as 429.
+            if resp.status == 401:
+                text = await resp.text()
+                if "require_login" in text:
+                    result["status"] = "rate_limited"
+                    return result
+                result["status"] = "unknown"
+                return result
+
+            if resp.status == 404:
+                result["status"] = "banned"
+                new_sig = compute_profile_sig(
+                    "banned", None, None, None, None, None, None
+                )
+                result["profile_sig"] = new_sig
+                if cached_sig and cached_sig == new_sig and os.path.exists(output_path):
+                    result["image"] = output_path
+                else:
+                    try:
+                        render_profile_card(
+                            username=username,
+                            output_path=output_path,
+                            status="banned",
+                        )
+                        result["image"] = output_path
+                    except Exception as e:
+                        print(f"Card rendering failed for @{username}: {e}")
+                return result
+
+            if resp.status != 200:
+                result["status"] = "unknown"
+                return result
+
+            text = await resp.text()
+            data = json.loads(text)
     except Exception as e:
-        # Any HTTP / network error from the API endpoint is NOT evidence that
-        # the Instagram account is banned. A 404 here is almost always a
-        # quota / auth / network problem on our side; a 200 with status:false
-        # is the real "banned / doesn't exist" signal (handled below).
-        # So all exception paths stay as "unknown" so we don't fire false
-        # "Recovered" / "Banned" notifications.
-        print(f"  [api] error fetching @{username}: {e!r}")
+        print(f"  [graphql] error fetching @{username}: {e!r}")
         result["status"] = "unknown"
+        return result
+
+    user = (data.get("data") or {}).get("user")
+    if not user:
+        result["status"] = "unknown"
+        return result
+
+    result["status"] = "active"
+    result["full_name"] = user.get("full_name") or None
+    result["bio"] = user.get("biography") or None
+
+    followers = (user.get("edge_followed_by") or {}).get("count")
+    following = (user.get("edge_follow") or {}).get("count")
+    posts = (user.get("edge_owner_to_timeline_media") or {}).get("count")
+    result["followers"] = int(followers) if isinstance(followers, int) else None
+    result["following"] = int(following) if isinstance(following, int) else None
+    result["posts"] = int(posts) if isinstance(posts, int) else None
+
+    avatar_url = user.get("profile_pic_url_hd") or user.get("profile_pic_url")
+    result["avatar_url"] = avatar_url
+
+    new_sig = compute_profile_sig(
+        result["status"],
+        result["followers"],
+        result["following"],
+        result["posts"],
+        result["full_name"],
+        result["bio"],
+        avatar_url,
+    )
+    result["profile_sig"] = new_sig
+
+    # Card cache: skip render if profile inputs are unchanged and PNG exists
+    if cached_sig and cached_sig == new_sig and os.path.exists(output_path):
+        result["image"] = output_path
+    else:
+        if avatar_url:
+            result["avatar_bytes"] = await _download_avatar(avatar_url)
         try:
             render_profile_card(
                 username=username,
                 output_path=output_path,
                 status=result["status"],
+                full_name=result.get("full_name"),
+                bio=result.get("bio"),
+                posts=result.get("posts"),
+                followers=result.get("followers"),
+                following=result.get("following"),
+                avatar_bytes=result.get("avatar_bytes"),
             )
             result["image"] = output_path
-        except Exception:
+        except Exception as e:
+            print(f"Card rendering failed for @{username}: {e}")
             result["image"] = None
-        return result
-
-    # The API puts the "is this a real account?" flag at the top level.
-    if not data.get("status"):
-        result["status"] = "banned"
-    else:
-        result["status"] = "active"
-
-    result["full_name"] = data.get("full_name") or None
-    result["bio"] = data.get("biography") or None
-
-    followers = (data.get("edge_followed_by") or {}).get("count")
-    following = (data.get("edge_follow") or {}).get("count")
-    posts = (data.get("edge_owner_to_timeline_media") or {}).get("count")
-    result["followers"] = int(followers) if isinstance(followers, int) else None
-    result["following"] = int(following) if isinstance(following, int) else None
-    result["posts"] = int(posts) if isinstance(posts, int) else None
-
-    avatar_url = data.get("profile_pic_url_hd") or data.get("profile_pic_url")
-    if avatar_url:
-        result["avatar_bytes"] = await _download_avatar(avatar_url)
-
-    try:
-        render_profile_card(
-            username=username,
-            output_path=output_path,
-            status=result["status"],
-            full_name=result.get("full_name"),
-            bio=result.get("bio"),
-            posts=result.get("posts"),
-            followers=result.get("followers"),
-            following=result.get("following"),
-            avatar_bytes=result.get("avatar_bytes"),
-        )
-        result["image"] = output_path
-    except Exception as e:
-        print(f"Card rendering failed for @{username}: {e}")
-        result["image"] = None
 
     return result
+
+
+async def close_session() -> None:
+    global _session
+    if _session is not None and not _session.closed:
+        await _session.close()
+        _session = None

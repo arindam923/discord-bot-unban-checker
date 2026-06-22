@@ -29,8 +29,12 @@ class WatchStore:
             return json.load(f)
 
     def _write(self, data):
-        with open(self.path, "w") as f:
+        """Atomic write: tmp file + os.replace so a crash mid-write
+        doesn't corrupt the watchlist."""
+        tmp = self.path + ".tmp"
+        with open(tmp, "w") as f:
             json.dump(data, f, indent=2)
+        os.replace(tmp, self.path)
 
     # -- public API -----------------------------------------------------
     async def add_watch(self, guild_id, channel_id, user_id, username, watch_type):
@@ -71,6 +75,20 @@ class WatchStore:
         async with self.lock:
             data = self._read()
             return [w for w in data["watches"] if w["active"]]
+
+    async def get_active_watches_grouped_by_username(self) -> dict[str, list[dict]]:
+        """Return active watches grouped by lowercase username.
+        Allows the periodic loop to probe each unique account once and
+        fan-out notifications to all watches for that account."""
+        async with self.lock:
+            data = self._read()
+            grouped: dict[str, list[dict]] = {}
+            for w in data["watches"]:
+                if not w["active"]:
+                    continue
+                key = w["username"].lower()
+                grouped.setdefault(key, []).append(w)
+            return grouped
 
     async def deactivate(self, watch_id):
         async with self.lock:

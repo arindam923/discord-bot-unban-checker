@@ -5,3 +5,4 @@ __pycache__/
 .DS_Store
 cards/
 watchlist.json
+status_cache.json
