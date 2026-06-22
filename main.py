@@ -55,8 +55,7 @@ try:
     os.environ.setdefault("SSL_CERT_FILE", certifi.where())
     os.environ.setdefault("REQUESTS_CA_BUNDLE", certifi.where())
     _SSL_CTX = ssl.create_default_context(cafile=certifi.where())
-except Exception as _cert_err:
-    print(f"certifi setup warning: {_cert_err!r}")
+except Exception:
     _SSL_CTX = None
 
 from card_renderer import render_profile_card
@@ -96,11 +95,7 @@ TIER_INTERVALS = {
     None: 60,  # default for never-checked accounts
 }
 
-# Post a single aggregate heartbeat to the alert channel every N ticks.
-# 5 ticks × 60s = 5 minutes.
-HEARTBEAT_EVERY_N_ITERATIONS = 5
-
-# Optional: channel ID for alerts (rate-limit, aggregate heartbeat).
+# Optional: channel ID for rate-limit alerts.
 # Falls back to the first guild's system channel.
 ALERT_CHANNEL_ID = os.getenv("ALERT_CHANNEL_ID")
 
@@ -192,8 +187,8 @@ async def _parse_usernames(
                                     if u.strip()
                                 ]
                     break
-                except Exception as e:
-                    print(f"Failed to read attachment {att.filename}: {e!r}")
+                except Exception:
+                    pass
 
     seen = set()
     unique = []
@@ -240,32 +235,21 @@ async def _resolve_channel(channel_id: int, guild_id: int | None = None):
                 )
                 if ch is not None:
                     return ch
-        except discord.Forbidden as e:
-            print(
-                f"_resolve_channel({channel_id}) fetch_guild({guild_id}) "
-                f"Forbidden: {e!r} (bot may be missing 'bot' OAuth scope)"
-            )
-        except (discord.NotFound, discord.HTTPException) as e:
-            print(
-                f"_resolve_channel({channel_id}) fetch_guild({guild_id}) {type(e).__name__}: {e!r}"
-            )
+        except discord.Forbidden:
+            pass
+        except (discord.NotFound, discord.HTTPException):
+            pass
     # Last resort: ask Discord directly. Works for DMs / threads.
     try:
         ch = await bot.fetch_channel(channel_id)
         if ch is not None:
             return ch
-    except discord.NotFound as e:
-        print(f"_resolve_channel({channel_id}) NotFound: {e!r}")
-    except discord.Forbidden as e:
-        print(f"_resolve_channel({channel_id}) Forbidden: {e!r}")
-    except Exception as e:
-        print(f"_resolve_channel({channel_id}) failed: {e!r}")
-    # All paths failed -- log detailed diagnostics
-    print(
-        f"_resolve_channel({channel_id}) exhausted all paths. "
-        f"bot.get_channel={bot.get_channel(channel_id)!r}, "
-        f"guilds={[g.name for g in bot.guilds]}"
-    )
+    except discord.NotFound:
+        pass
+    except discord.Forbidden:
+        pass
+    except Exception:
+        pass
     return None
 
 
@@ -328,12 +312,11 @@ async def _send_alert(message: str) -> None:
     """Send a one-line alert to the alert channel. Best-effort, never raises."""
     channel = await _resolve_alert_channel()
     if channel is None:
-        print(f"[alert] no channel available: {message}")
         return
     try:
         await channel.send(message)
-    except Exception as e:
-        print(f"[alert] failed to send: {e!r}")
+    except Exception:
+        pass
 
 
 def build_embed(
@@ -363,16 +346,6 @@ def attach_card_image(embed: discord.Embed, info: dict):
 
 @bot.event
 async def on_ready():
-    print(f"Logged in as {bot.user} (id: {bot.user.id})")
-    # Log every guild + text channel the bot can see, so a future 'channel
-    # not found' is easy to diagnose -- you'll know which channels the bot
-    # actually has cached.
-    for guild in bot.guilds:
-        names = [c.name for c in guild.text_channels[:5]]
-        print(
-            f"  Guild '{guild.name}' ({guild.id}) -- "
-            f"{len(guild.text_channels)} text channels, sample: {names}"
-        )
     # One-time cleanup: drop any watch whose channel the bot can't reach.
     try:
         watches = await store.get_active_watches()
@@ -382,32 +355,23 @@ async def on_ready():
             if ch is None:
                 dead.append(w["channel_id"])
         if dead:
-            removed = await store.cleanup_dead_watches(set(dead))
-            print(
-                f"Startup cleanup: removed {removed} watch(es) pointing "
-                f"to unreachable channels: {dead}"
-            )
-        else:
-            print(f"Startup cleanup: all {len(watches)} active watch(es) reachable.")
-    except Exception as e:
-        print(f"Startup cleanup failed: {e!r}")
+            await store.cleanup_dead_watches(set(dead))
+    except Exception:
+        pass
 
     try:
         await bot.tree.sync()
-    except Exception as e:
-        print(f"Slash command sync failed: {e}")
+    except Exception:
+        pass
+
     if not periodic_check.is_running():
         periodic_check.start()
-        print(f"Started periodic_check loop (every {CHECK_INTERVAL_SECONDS}s)")
-    else:
-        print("periodic_check loop already running")
 
-    # Print cache status at startup
+    # Prime cache at startup
     try:
-        cache_all = await status_cache.get_all()
-        print(f"  Status cache: {len(cache_all)} cached account(s)")
-    except Exception as e:
-        print(f"  Status check failed: {e!r}")
+        await status_cache.get_all()
+    except Exception:
+        pass
 
 
 def _guild_id(ctx):
@@ -813,46 +777,23 @@ async def periodic_check():
     global _loop_iteration
     _loop_iteration += 1
     _loop_stats["runs"] += 1
-    iter_id = _loop_iteration
 
     try:
         grouped = await store.get_active_watches_grouped_by_username()
-    except Exception as e:
-        print(f"[iter {iter_id}] failed to load watches: {e!r}")
+    except Exception:
         _loop_stats["errors"] += 1
         return
 
     if not grouped:
-        if iter_id == 1 or iter_id % 30 == 0:
-            print(f"[iter {iter_id}] no active watches")
         return
 
     all_usernames = list(grouped.keys())
-    total_watches = sum(len(ws) for ws in grouped.values())
 
     # Filter to only accounts that are due for their tier
     due_usernames = await status_cache.get_due_usernames(all_usernames, TIER_INTERVALS)
-    skipped = len(all_usernames) - len(due_usernames)
 
     if not due_usernames:
-        if iter_id % 10 == 0:
-            print(
-                f"[iter {iter_id}] {len(all_usernames)} account(s), "
-                f"0 due this tick ({skipped} skipped by tier)"
-            )
-        # Still send heartbeat
-        if iter_id % HEARTBEAT_EVERY_N_ITERATIONS == 0:
-            await _send_alert(
-                f"💓 Watching {len(all_usernames)} account(s) · "
-                f"0 due this tick · {skipped} skipped by tier schedule"
-            )
         return
-
-    print(
-        f"[iter {iter_id}] {len(all_usernames)} account(s), "
-        f"{len(due_usernames)} due ({skipped} skipped by tier) "
-        f"for {total_watches} watch(es)"
-    )
 
     sweep_start = time.time()
     sem = asyncio.Semaphore(CHECK_CONCURRENCY)
@@ -874,8 +815,7 @@ async def periodic_check():
             try:
                 info = await check_instagram_account(orig, path, cached_sig=cached_sig)
                 _loop_stats["checks"] += 1
-            except Exception as e:
-                print(f"[iter {iter_id}] error checking @{orig}: {e!r}")
+            except Exception:
                 _loop_stats["errors"] += 1
                 results[username_lower] = (prev_status, None, None)
                 return
@@ -900,11 +840,6 @@ async def periodic_check():
             iter_cache_hits += 1
         else:
             iter_cache_misses += 1
-            if prev_status != status:
-                print(
-                    f"[iter {iter_id}] @{orig} status transition: "
-                    f"{prev_status} -> {status}"
-                )
 
         await status_cache.set(
             username_lower,
@@ -927,7 +862,6 @@ async def periodic_check():
     _loop_stats["cache_misses"] += iter_cache_misses
 
     if rate_limited:
-        print(f"[iter {iter_id}] Instagram rate-limited; pausing 5 min")
         _loop_stats["errors"] += 1
         await _send_alert(
             "⚠️ Instagram rate-limited the sweep (soft IP block). Pausing 5 min. "
@@ -949,24 +883,10 @@ async def periodic_check():
             # Skip if status unchanged from previous check (already notified)
             if prev_status == new_status:
                 continue
-            await _notify_watch(w, new_status, info, iter_id)
-
-    # Aggregate heartbeat to alert channel
-    if iter_id % HEARTBEAT_EVERY_N_ITERATIONS == 0:
-        sweep_s = _loop_stats["last_sweep_duration"]
-        total_cache = iter_cache_hits + iter_cache_misses
-        hit_pct = (
-            f"{iter_cache_hits / total_cache * 100:.0f}%" if total_cache > 0 else "n/a"
-        )
-        await _send_alert(
-            f"💓 Watching {len(all_usernames)} account(s) · "
-            f"{len(due_usernames)} checked, {skipped} skipped · "
-            f"sweep {sweep_s:.1f}s · "
-            f"card cache {hit_pct}"
-        )
+            await _notify_watch(w, new_status, info)
 
 
-async def _notify_watch(w: dict, confirmed: str, info: dict, iter_id: int) -> None:
+async def _notify_watch(w: dict, confirmed: str, info: dict) -> None:
     """Send a ban/unban notification for a single watch and deactivate it."""
     username = w["username"]
     if confirmed == "active":
@@ -981,10 +901,6 @@ async def _notify_watch(w: dict, confirmed: str, info: dict, iter_id: int) -> No
 
     channel = await _resolve_channel(w["channel_id"], w.get("guild_id"))
     if channel is None:
-        print(
-            f"[iter {iter_id}] channel {w['channel_id']} gone for "
-            f"@{username}; deleting watch"
-        )
         await store.delete_watch(w["id"])
         return
 
@@ -994,24 +910,11 @@ async def _notify_watch(w: dict, confirmed: str, info: dict, iter_id: int) -> No
         else:
             await channel.send(content=f"<@{w['user_id']}>", embed=embed)
         _loop_stats["fired"] += 1
-        print(
-            f"[iter {iter_id}] notified for @{username} "
-            f"({w['watch_type']}) in {w['channel_id']}"
-        )
     except discord.Forbidden:
-        print(
-            f"[iter {iter_id}] forbidden in {w['channel_id']} for "
-            f"@{username}; deleting watch"
-        )
         await store.delete_watch(w["id"])
     except discord.NotFound:
-        print(
-            f"[iter {iter_id}] channel {w['channel_id']} deleted for "
-            f"@{username}; deleting watch"
-        )
         await store.delete_watch(w["id"])
-    except Exception as e:
-        print(f"[iter {iter_id}] send failed for @{username}: {e!r}; deleting watch")
+    except Exception:
         await store.delete_watch(w["id"])
     else:
         await store.deactivate(w["id"])
@@ -1019,37 +922,25 @@ async def _notify_watch(w: dict, confirmed: str, info: dict, iter_id: int) -> No
 
 @periodic_check.before_loop
 async def before_periodic_check():
-    print("periodic_check: waiting for bot to be ready...")
     await bot.wait_until_ready()
     # Wait for the guild cache to be populated. discord.py fires on_ready
     # before all guild channels are loaded, which causes get_channel() to
     # return None for valid channels. Wait a few seconds for the cache to
     # settle, and also wait until we have at least one guild with channels.
-    print("periodic_check: waiting for guild cache to populate...")
     for _ in range(30):  # up to 30 seconds
         if bot.guilds and any(g.channels for g in bot.guilds):
             break
         await asyncio.sleep(1)
-    print(
-        f"periodic_check: cache ready, {len(bot.guilds)} guild(s), "
-        f"{sum(len(g.channels) for g in bot.guilds)} total channels. "
-        f"Loop will start firing."
-    )
 
 
 @periodic_check.error
 async def periodic_check_error(error):
-    """If the loop itself crashes, log it loudly and restart it."""
-    print(f"[FATAL] periodic_check crashed: {error!r}")
-    import traceback
-
-    traceback.print_exc()
+    """If the loop itself crashes, restart it."""
     if not periodic_check.is_running():
         try:
             periodic_check.restart()
-            print("periodic_check restarted after crash.")
-        except Exception as e:
-            print(f"Failed to restart periodic_check: {e!r}")
+        except Exception:
+            pass
 
 
 if __name__ == "__main__":

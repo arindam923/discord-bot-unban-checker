@@ -3,7 +3,7 @@ Fetches Instagram profile data directly from Instagram's own GraphQL API.
 
 NO RapidAPI. NO API key. NO quota. NO monthly limit.
 
-Endpoint: i.instagram.com/api/v1/users/web_profile_info/?username=<u>
+Endpoint: www.instagram.com/api/v1/users/web_profile_info/?username=<u>
 Headers:  X-IG-App-ID (Instagram's public web app ID), User-Agent, Referer
 
 This is the same endpoint Instagram's own web frontend calls when you open
@@ -17,15 +17,23 @@ Status detection:
   - "rate_limited" -- HTTP 429 (per-IP rate limit; needs proxies or slower interval)
   - "unknown"      -- network error, non-JSON response, parse failure
 
+Anti rate-limit mitigation:
+  A cookie warmup (GET https://www.instagram.com/) seeds the session with
+  `mid`, `csrftoken`, `ig_nrcb` cookies that Instagram issues to real
+  browsers. On a 429 or 401 require_login response we re-warm once and retry
+  the request. This evades soft cookie-less blocks but will NOT help if the
+  egress IP itself is hard-blocked by Instagram (typical for cloud/VPS IPs)
+  -- in that case set PROXY_URLS to rotate egress IPs.
+
 A shared aiohttp.ClientSession is used for connection pooling. In-memory
 avatar cache keyed by CDN URL avoids re-downloading the same avatar. Card
 render is skipped when the profile signature is unchanged from cache.
 """
 
+import asyncio
 import json
 import os
 import ssl
-import time
 
 import aiohttp
 from dotenv import load_dotenv
@@ -52,31 +60,60 @@ USER_AGENT = (
 # It is NOT a secret and is not tied to any account or quota.
 IG_APP_ID = "936619743392459"
 
-GRAPHQL_URL = "https://i.instagram.com/api/v1/users/web_profile_info/"
+GRAPHQL_URL = "https://www.instagram.com/api/v1/users/web_profile_info/"
+WARMUP_URL = "https://www.instagram.com/"
 
 # Shared session for connection pooling (lazy-init, lives for bot lifetime)
 _session: aiohttp.ClientSession | None = None
+
+# Whether the cookie warmup has already been performed for the current session.
+_warmup_done = False
 
 # In-memory avatar cache: url -> bytes (or None if download failed).
 _avatar_url_cache: dict[str, bytes | None] = {}
 
 
 async def _get_session() -> aiohttp.ClientSession:
-    global _session
+    global _session, _warmup_done
     if _session is None or _session.closed:
         connector = aiohttp.TCPConnector(limit=0, limit_per_host=0, ssl=_AIOHTTP_SSL)
+        # unsafe=True so the jar keeps cookies regardless of the host we hit
+        # (warmup host vs GraphQL host both share the .instagram.com domain,
+        # but unsafe guards against any future endpoint/host changes).
+        jar = aiohttp.CookieJar(unsafe=True)
         _session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=15),
             connector=connector,
+            cookie_jar=jar,
             headers={
                 "User-Agent": USER_AGENT,
                 "X-IG-App-ID": IG_APP_ID,
                 "Accept": "*/*",
                 "Accept-Language": "en-US,en;q=0.9",
-                "Referer": "https://www.instagram.com/",
+                "Referer": WARMUP_URL,
             },
         )
+        _warmup_done = False
     return _session
+
+
+async def _warmup(force: bool = False) -> None:
+    """Seed the session with Instagram's browser-issued cookies
+    (mid / csrftoken / ig_nrcb). Idempotent unless `force=True`."""
+    global _warmup_done
+    if _warmup_done and not force:
+        return
+    try:
+        session = await _get_session()
+        async with session.get(
+            WARMUP_URL,
+            timeout=aiohttp.ClientTimeout(total=15),
+            allow_redirects=True,
+        ):
+            pass
+    except Exception:
+        pass
+    _warmup_done = True
 
 
 async def _download_avatar(url: str) -> bytes | None:
@@ -138,55 +175,76 @@ async def check_instagram_account(
         "profile_sig": None,
     }
 
+    data = None
     try:
         session = await _get_session()
-        async with session.get(
-            GRAPHQL_URL,
-            params={"username": username},
-        ) as resp:
-            if resp.status == 429:
-                result["status"] = "rate_limited"
-                return result
+        await _warmup()
+        for attempt in range(2):
+            async with session.get(
+                GRAPHQL_URL,
+                params={"username": username},
+            ) as resp:
+                # On 429 / 401-require_login: re-warm cookies once and retry.
+                if resp.status == 429 and attempt == 0:
+                    await asyncio.sleep(2)
+                    await _warmup(force=True)
+                    continue
+                if resp.status == 401 and attempt == 0:
+                    text_401 = await resp.text()
+                    if "require_login" in text_401:
+                        await asyncio.sleep(2)
+                        await _warmup(force=True)
+                        continue
+                    result["status"] = "unknown"
+                    return result
 
-            # Instagram returns 401 with "require_login" when the IP is
-            # temporarily rate-limited (soft block). Treat same as 429.
-            if resp.status == 401:
-                text = await resp.text()
-                if "require_login" in text:
+                if resp.status == 429:
                     result["status"] = "rate_limited"
                     return result
-                result["status"] = "unknown"
-                return result
+                if resp.status == 401:
+                    text_401 = await resp.text()
+                    result["status"] = (
+                        "rate_limited" if "require_login" in text_401 else "unknown"
+                    )
+                    return result
 
-            if resp.status == 404:
-                result["status"] = "banned"
-                new_sig = compute_profile_sig(
-                    "banned", None, None, None, None, None, None
-                )
-                result["profile_sig"] = new_sig
-                if cached_sig and cached_sig == new_sig and os.path.exists(output_path):
-                    result["image"] = output_path
-                else:
-                    try:
-                        render_profile_card(
-                            username=username,
-                            output_path=output_path,
-                            status="banned",
-                        )
+                if resp.status == 404:
+                    result["status"] = "banned"
+                    new_sig = compute_profile_sig(
+                        "banned", None, None, None, None, None, None
+                    )
+                    result["profile_sig"] = new_sig
+                    if (
+                        cached_sig
+                        and cached_sig == new_sig
+                        and os.path.exists(output_path)
+                    ):
                         result["image"] = output_path
-                    except Exception as e:
-                        print(f"Card rendering failed for @{username}: {e}")
-                return result
+                    else:
+                        try:
+                            render_profile_card(
+                                username=username,
+                                output_path=output_path,
+                                status="banned",
+                            )
+                            result["image"] = output_path
+                        except Exception:
+                            pass
+                    return result
 
-            if resp.status != 200:
-                result["status"] = "unknown"
-                return result
+                if resp.status != 200:
+                    result["status"] = "unknown"
+                    return result
 
-            text = await resp.text()
-            data = json.loads(text)
-    except Exception as e:
-        print(f"  [graphql] error fetching @{username}: {e!r}")
+                text = await resp.text()
+                data = json.loads(text)
+                break
+    except Exception:
         result["status"] = "unknown"
+        return result
+
+    if data is None:
+        result["status"] = "rate_limited"
         return result
 
     user = (data.get("data") or {}).get("user")
@@ -238,8 +296,7 @@ async def check_instagram_account(
                 avatar_bytes=result.get("avatar_bytes"),
             )
             result["image"] = output_path
-        except Exception as e:
-            print(f"Card rendering failed for @{username}: {e}")
+        except Exception:
             result["image"] = None
 
     return result
