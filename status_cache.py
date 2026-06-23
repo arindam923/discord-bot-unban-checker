@@ -14,7 +14,9 @@ Schema (status_cache.json):
     "last_checked": <unix_ts>,
     "last_seen": <unix_ts>,
     "profile_sig": "<hash>" | null,
-    "avatar_url": "<url>" | null
+    "avatar_url": "<url>" | null,
+    "retry_after": <unix_ts> | null,
+    "retry_count": <int> | null
   }
 }
 """
@@ -116,6 +118,10 @@ class StatusCache:
             for username in usernames:
                 key = username.lower()
                 entry = data.get(key)
+                # Skip if still inside rate-limit backoff window
+                retry_after = entry.get("retry_after") if entry else None
+                if retry_after is not None and now < retry_after:
+                    continue
                 if entry is None or entry.get("last_checked") is None:
                     due.append(username)
                     continue
@@ -124,6 +130,30 @@ class StatusCache:
                 if now - entry["last_checked"] >= interval:
                     due.append(username)
             return due
+
+    async def set_rate_limited(self, username: str) -> None:
+        """Mark an account as rate-limited with exponential backoff.
+        retry_after = now + 60s, 120s, 240s, ... up to 900s (15 min)."""
+        async with self.lock:
+            data = self._read()
+            key = username.lower()
+            entry = data.get(key, {})
+            retry_count = entry.get("retry_count", 0) + 1
+            delay = min(60 * (2 ** (retry_count - 1)), 900)
+            entry["retry_after"] = time.time() + delay
+            entry["retry_count"] = retry_count
+            data[key] = entry
+            self._write_atomic(data)
+
+    async def clear_retry_backoff(self, username: str) -> None:
+        """Reset retry backoff when account is successfully checked."""
+        async with self.lock:
+            data = self._read()
+            key = username.lower()
+            if key in data:
+                data[key].pop("retry_after", None)
+                data[key].pop("retry_count", None)
+                self._write_atomic(data)
 
     async def delete(self, username: str) -> None:
         async with self.lock:

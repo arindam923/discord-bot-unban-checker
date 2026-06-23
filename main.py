@@ -26,14 +26,16 @@ Polling architecture:
   For each account:
     - HTTP 200 + JSON → status="active", full profile data available
     - HTTP 404       → status="banned" (account gone)
-    - HTTP 429/401   → status="rate_limited" (pause + alert)
+    - HTTP 429/401   → status="rate_limited" (deferred with backoff)
 
-  A persistent status_cache.json tracks the last status + profile signature
-  per username. If both are unchanged, the card PNG render is skipped.
-  Notifications only fire on actual status transitions (active↔banned).
+   A persistent status_cache.json tracks the last status + profile signature
+   per username. If both are unchanged, the card PNG render is skipped.
+   Notifications only fire on actual status transitions (active↔banned).
 
-  If Instagram 429s the sweep (per-IP rate limit), the loop pauses for 5 min
-  and posts an alert. Set PROXY_URLS in .env to rotate across egress IPs.
+   If Instagram rate-limits a request, the account is deferred with
+   exponential backoff (60s → 15 min max) so it retries automatically
+   without blocking the sweep. Set PROXY_URLS in .env to rotate across
+   egress IPs and reduce rate-limiting.
 """
 
 import asyncio
@@ -585,8 +587,6 @@ async def checkstatus(
     title_map = {
         "active": "Account Active | @{u} ✅",
         "banned": "Account Banned | @{u} ❌",
-        "rate_limited": "Rate Limited | @{u} ⏸️",
-        "unknown": "Status Unknown | @{u} ⚠️",
     }
 
     sem = asyncio.Semaphore(CHECK_CONCURRENCY)
@@ -601,11 +601,16 @@ async def checkstatus(
 
     results = await asyncio.gather(*[_check_one_status(u) for u in usernames])
 
+    successful = 0
     for uname, info in zip(usernames, results):
         if "_error" in info:
-            await _reply(ctx, f"❌ Error checking @{_esc(uname)}: {info['_error']}")
+            print(f"[checkstatus] {uname}: ERROR {info['_error']}", flush=True)
             continue
-        title_tmpl = title_map.get(info["status"], "Status Unknown | @{u} ⚠️")
+        if info["status"] not in ("active", "banned"):
+            print(f"[checkstatus] {uname}: skipped ({info['status']})", flush=True)
+            continue
+        successful += 1
+        title_tmpl = title_map[info["status"]]
         embed = build_embed(title_tmpl.format(u=uname), uname, info)
         file = attach_card_image(embed, info)
         if file:
@@ -614,7 +619,9 @@ async def checkstatus(
             await _reply(ctx, embed=embed)
 
     if len(usernames) > 1:
-        await _reply(ctx, f"✅ Checked {len(usernames)} accounts.")
+        await _reply(
+            ctx, f"✅ {successful}/{len(usernames)} accounts fetched successfully."
+        )
 
 
 @bot.hybrid_command(
@@ -820,10 +827,9 @@ async def periodic_check():
     results: dict[str, tuple[str | None, str | None, dict | None]] = {}
     iter_cache_hits = 0
     iter_cache_misses = 0
-    rate_limited = False
 
     async def _check_one(username_lower: str) -> None:
-        nonlocal iter_cache_hits, iter_cache_misses, rate_limited
+        nonlocal iter_cache_hits, iter_cache_misses
         orig = grouped[username_lower][0]["username"]
         cached = await status_cache.get(username_lower)
         cached_sig = cached.get("profile_sig") if cached else None
@@ -842,7 +848,7 @@ async def periodic_check():
         status = info["status"]
 
         if status == "rate_limited":
-            rate_limited = True
+            await status_cache.set_rate_limited(username_lower)
             results[username_lower] = (prev_status, None, None)
             return
 
@@ -860,6 +866,7 @@ async def periodic_check():
         else:
             iter_cache_misses += 1
 
+        await status_cache.clear_retry_backoff(username_lower)
         await status_cache.set(
             username_lower,
             {
@@ -879,16 +886,6 @@ async def periodic_check():
     _loop_stats["last_sweep_duration"] = time.time() - sweep_start
     _loop_stats["cache_hits"] += iter_cache_hits
     _loop_stats["cache_misses"] += iter_cache_misses
-
-    if rate_limited:
-        _loop_stats["errors"] += 1
-        await _send_alert(
-            "⚠️ Instagram rate-limited the sweep (soft IP block). Pausing 5 min. "
-            "Consider lowering CHECK_CONCURRENCY, increasing CHECK_INTERVAL_SECONDS, "
-            "or adding proxies via PROXY_URLS in .env."
-        )
-        await asyncio.sleep(300)
-        return
 
     # Fan-out notifications: notify when desired status is met, then delete
     for username_lower, (prev_status, new_status, info) in results.items():
