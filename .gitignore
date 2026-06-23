@@ -6,3 +6,4 @@ __pycache__/
 cards/
 watchlist.json
 status_cache.json
+bot.log

@@ -22,8 +22,20 @@ Anti rate-limit mitigation:
   `mid`, `csrftoken`, `ig_nrcb` cookies that Instagram issues to real
   browsers. On a 429 or 401 require_login response we re-warm once and retry
   the request. This evades soft cookie-less blocks but will NOT help if the
-  egress IP itself is hard-blocked by Instagram (typical for cloud/VPS IPs)
-  -- in that case set PROXY_URLS to rotate egress IPs.
+  egress IP itself is hard-blocked by Instagram (typical for cloud/VPS IPs).
+
+Proxy rotation:
+  Set PROXY_URLS in .env (comma-separated). Two formats are accepted:
+    1) "host:port:user:pass"               (Geonode / sticky-provider style)
+    2) "http://user:pass@host:port"        (standard URL form)
+  Each request routes through the next proxy in round-robin order. With
+  rotating residential backends the same proxy URL hands out a fresh egress
+  IP per call, so retrying a 429 / 401 require_login through the same URL
+  usually re-rolls past the soft block. The cookie jar is wiped before
+  every retry so a soft-blocked device fingerprint from a failed attempt
+  cannot taint the next one.
+
+  When PROXY_URLS is unset, all calls go direct (no proxy).
 
 A shared aiohttp.ClientSession is used for connection pooling. In-memory
 avatar cache keyed by CDN URL avoids re-downloading the same avatar. Card
@@ -31,6 +43,7 @@ render is skipped when the profile signature is unchanged from cache.
 """
 
 import asyncio
+import itertools
 import json
 import os
 import ssl
@@ -63,18 +76,61 @@ IG_APP_ID = "936619743392459"
 GRAPHQL_URL = "https://www.instagram.com/api/v1/users/web_profile_info/"
 WARMUP_URL = "https://www.instagram.com/"
 
+
+def _parse_proxy_list(raw: str | None) -> list[str]:
+    """Parse PROXY_URLS env var into a list of aiohttp-ready proxy URLs.
+    Accepts both `host:port:user:pass` and `http://user:pass@host:port`."""
+    if not raw:
+        return []
+    out: list[str] = []
+    seen: set[str] = set()
+    for token in raw.split(","):
+        token = token.strip()
+        if not token:
+            continue
+        url = token if "://" in token else _colon_form_to_url(token)
+        if url and url not in seen:
+            seen.add(url)
+            out.append(url)
+    return out
+
+
+def _colon_form_to_url(spec: str) -> str:
+    """Convert 'host:port:user:pass' -> 'http://user:pass@host:port'.
+    Also tolerates 'host:port' (no auth) and 'host:port:user'
+    (user only, no pass)."""
+    parts = spec.split(":")
+    if len(parts) < 2:
+        return ""
+    host, port = parts[0], parts[1]
+    if len(parts) == 2:
+        return f"http://{host}:{port}"
+    user = parts[2]
+    if len(parts) >= 4:
+        pwd = ":".join(parts[3:])  # in case password itself contains ':'
+        return f"http://{user}:{pwd}@{host}:{port}"
+    return f"http://{user}@{host}:{port}"
+
+
+PROXIES: list[str] = _parse_proxy_list(os.getenv("PROXY_URLS"))
+_proxy_cycle = itertools.cycle(PROXIES) if PROXIES else None
+
 # Shared session for connection pooling (lazy-init, lives for bot lifetime)
 _session: aiohttp.ClientSession | None = None
-
-# Whether the cookie warmup has already been performed for the current session.
-_warmup_done = False
 
 # In-memory avatar cache: url -> bytes (or None if download failed).
 _avatar_url_cache: dict[str, bytes | None] = {}
 
 
+def _next_proxy() -> str | None:
+    """Return the next proxy URL in round-robin order, or None if no proxies."""
+    if _proxy_cycle is None:
+        return None
+    return next(_proxy_cycle)
+
+
 async def _get_session() -> aiohttp.ClientSession:
-    global _session, _warmup_done
+    global _session
     if _session is None or _session.closed:
         connector = aiohttp.TCPConnector(limit=0, limit_per_host=0, ssl=_AIOHTTP_SSL)
         # unsafe=True so the jar keeps cookies regardless of the host we hit
@@ -93,27 +149,29 @@ async def _get_session() -> aiohttp.ClientSession:
                 "Referer": WARMUP_URL,
             },
         )
-        _warmup_done = False
     return _session
 
 
-async def _warmup(force: bool = False) -> None:
+async def _warmup(proxy: str | None, clear_cookies: bool = False) -> None:
     """Seed the session with Instagram's browser-issued cookies
-    (mid / csrftoken / ig_nrcb). Idempotent unless `force=True`."""
-    global _warmup_done
-    if _warmup_done and not force:
-        return
+    (mid / csrftoken / ig_nrcb) through the given proxy. Best-effort.
+
+    When `clear_cookies=True`, wipe the jar first so retry attempts get a
+    pristine cookie set issued by the current (rotated) egress IP, not a
+    soft-blocked fingerprint left over from a prior failed attempt."""
     try:
         session = await _get_session()
+        if clear_cookies and session.cookie_jar is not None:
+            session.cookie_jar.clear()
         async with session.get(
             WARMUP_URL,
+            proxy=proxy,
             timeout=aiohttp.ClientTimeout(total=15),
             allow_redirects=True,
         ):
             pass
     except Exception:
         pass
-    _warmup_done = True
 
 
 async def _download_avatar(url: str) -> bytes | None:
@@ -125,6 +183,7 @@ async def _download_avatar(url: str) -> bytes | None:
         session = await _get_session()
         async with session.get(
             url,
+            proxy=_next_proxy(),
             headers={"User-Agent": USER_AGENT},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
@@ -137,6 +196,32 @@ async def _download_avatar(url: str) -> bytes | None:
         pass
     _avatar_url_cache[url] = None
     return None
+
+
+async def _fetch_profile(
+    username: str, proxy: str | None, clear_cookies: bool = False
+) -> tuple[int | None, str | None, dict | None]:
+    """One GraphQL attempt. Returns (status_code, response_text, parsed_json).
+    On connection error returns (None, None, None)."""
+    try:
+        session = await _get_session()
+        await _warmup(proxy, clear_cookies=clear_cookies)
+        async with session.get(
+            GRAPHQL_URL,
+            params={"username": username},
+            proxy=proxy,
+            timeout=aiohttp.ClientTimeout(total=15),
+        ) as resp:
+            text = await resp.text()
+            data = None
+            if resp.status == 200:
+                try:
+                    data = json.loads(text)
+                except Exception:
+                    data = None
+            return resp.status, text, data
+    except Exception:
+        return None, None, None
 
 
 async def check_instagram_account(
@@ -175,75 +260,71 @@ async def check_instagram_account(
         "profile_sig": None,
     }
 
-    data = None
-    try:
-        session = await _get_session()
-        await _warmup()
-        for attempt in range(2):
-            async with session.get(
-                GRAPHQL_URL,
-                params={"username": username},
-            ) as resp:
-                # On 429 / 401-require_login: re-warm cookies once and retry.
-                if resp.status == 429 and attempt == 0:
-                    await asyncio.sleep(2)
-                    await _warmup(force=True)
-                    continue
-                if resp.status == 401 and attempt == 0:
-                    text_401 = await resp.text()
-                    if "require_login" in text_401:
-                        await asyncio.sleep(2)
-                        await _warmup(force=True)
-                        continue
-                    result["status"] = "unknown"
-                    return result
+    # Attempt count: with rotating residential proxies the same proxy URL
+    # hands out a fresh egress IP per request, so retrying across attempts
+    # re-rolls the IP. Cap at 5 so a stuck proxy doesn't burn all bandwidth.
+    if PROXIES:
+        attempts = min(max(len(PROXIES), 3), 5)
+    else:
+        attempts = 1
 
-                if resp.status == 429:
-                    result["status"] = "rate_limited"
-                    return result
-                if resp.status == 401:
-                    text_401 = await resp.text()
-                    result["status"] = (
-                        "rate_limited" if "require_login" in text_401 else "unknown"
-                    )
-                    return result
+    data: dict | None = None
+    final_status_code: int | None = None
+    final_text: str | None = None
+    last_was_401_login = False
 
-                if resp.status == 404:
-                    result["status"] = "banned"
-                    new_sig = compute_profile_sig(
-                        "banned", None, None, None, None, None, None
-                    )
-                    result["profile_sig"] = new_sig
-                    if (
-                        cached_sig
-                        and cached_sig == new_sig
-                        and os.path.exists(output_path)
-                    ):
-                        result["image"] = output_path
-                    else:
-                        try:
-                            render_profile_card(
-                                username=username,
-                                output_path=output_path,
-                                status="banned",
-                            )
-                            result["image"] = output_path
-                        except Exception:
-                            pass
-                    return result
-
-                if resp.status != 200:
-                    result["status"] = "unknown"
-                    return result
-
-                text = await resp.text()
-                data = json.loads(text)
-                break
-    except Exception:
-        result["status"] = "unknown"
-        return result
+    for attempt in range(attempts):
+        proxy = _next_proxy() if PROXIES else None
+        code, text, parsed = await _fetch_profile(
+            username, proxy, clear_cookies=attempt > 0
+        )
+        if code is None:
+            # Connection error through this proxy → try next proxy.
+            continue
+        final_status_code = code
+        final_text = text
+        # Retryable rate-limit signals: 429, 401 require_login. Try next proxy.
+        if code == 429 and attempt < attempts - 1:
+            await asyncio.sleep(1)
+            continue
+        if code == 401 and "require_login" in (text or ""):
+            last_was_401_login = True
+            if attempt < attempts - 1:
+                await asyncio.sleep(1)
+                continue
+        if code == 200 and parsed is not None:
+            data = parsed
+        break
 
     if data is None:
+        if final_status_code == 404:
+            result["status"] = "banned"
+            new_sig = compute_profile_sig("banned", None, None, None, None, None, None)
+            result["profile_sig"] = new_sig
+            if cached_sig and cached_sig == new_sig and os.path.exists(output_path):
+                result["image"] = output_path
+            else:
+                try:
+                    render_profile_card(
+                        username=username,
+                        output_path=output_path,
+                        status="banned",
+                    )
+                    result["image"] = output_path
+                except Exception:
+                    pass
+            return result
+        if final_status_code in (429, 401) and (
+            final_status_code == 429
+            or last_was_401_login
+            or "require_login" in (final_text or "")
+        ):
+            result["status"] = "rate_limited"
+            return result
+        if final_status_code is not None:
+            result["status"] = "unknown"
+            return result
+        # No proxy/connection succeeded at all
         result["status"] = "rate_limited"
         return result
 
