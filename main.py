@@ -38,6 +38,7 @@ Polling architecture:
 
 import asyncio
 import os
+import re
 import ssl
 import time
 
@@ -61,7 +62,7 @@ except Exception:
 from card_renderer import render_profile_card
 from instagram_checker import check_instagram_account
 from status_cache import StatusCache
-from storage import WatchStore
+from storage import WatchStore, _sanitize_username
 
 ESC = str.maketrans({"_": r"\_"})
 
@@ -77,12 +78,12 @@ TOKEN = os.getenv("DISCORD_TOKEN")
 # accounts are only checked based on their tier interval below (not every
 # tick). This dramatically reduces API calls — active accounts are only
 # checked every 5 min, banned every 1 min, etc.
-CHECK_INTERVAL_SECONDS = 60
+CHECK_INTERVAL_SECONDS = 120
 
 # How many accounts to fetch in parallel inside one tick.
 # 8 is safe from one IP without triggering Instagram's soft rate limit.
 # If you consistently get rate_limited, lower this to 4 or add proxies.
-CHECK_CONCURRENCY = 8
+CHECK_CONCURRENCY = 3
 
 # Status-based check frequency (seconds since last_checked).
 # Active accounts are checked less often (bans are rare events).
@@ -153,12 +154,12 @@ def build_stats_description(info: dict, elapsed_seconds: float | None = None) ->
 
 async def _parse_usernames(
     ctx: commands.Context,
-    username_str: str | None,
-    attachment: discord.Attachment | None = None,
+    username_str: str | None = None,
+    file: discord.Attachment | None = None,
 ) -> list[str]:
-    """Parse usernames from command argument (comma/space/newline-separated)
-    or attached .txt file. Returns a list of clean, case-insensitively
-    deduplicated usernames."""
+    """Parse usernames from command argument (comma/space/newline-separated),
+    slash-command file upload, or prefix-command message attachment .txt file.
+    Returns a list of clean, case-insensitively deduplicated usernames."""
     usernames = []
 
     def _normalize_one(raw: str) -> str:
@@ -171,7 +172,7 @@ async def _parse_usernames(
         # "camping_lovee     @frog_ins".
         for sep in (",", "\r\n", "\n", "\t"):
             s = s.replace(sep, " ")
-        return [tok for tok in s.split(" ") if tok]
+        return [tok.strip() for tok in s.split(" ") if tok.strip()]
 
     if username_str:
         usernames = [
@@ -180,10 +181,10 @@ async def _parse_usernames(
             if _normalize_one(tok)
         ]
 
-    # Gather attachments: explicit parameter (slash command) or message attachments (prefix)
+    # Gather attachments: explicit slash-command parameter, then message attachments (prefix)
     attachments: list[discord.Attachment] = []
-    if attachment is not None:
-        attachments.append(attachment)
+    if file:
+        attachments.append(file)
     message = getattr(ctx, "message", None)
     if message and message.attachments:
         attachments.extend(message.attachments)
@@ -208,9 +209,12 @@ async def _parse_usernames(
     seen = set()
     unique = []
     for u in usernames:
-        if u.lower() not in seen:
-            seen.add(u.lower())
-            unique.append(u)
+        # Sanitize username using the utility function
+        sanitized = _sanitize_username(u)
+        for u_clean in sanitized:
+            if u_clean.lower() not in seen:
+                seen.add(u_clean.lower())
+                unique.append(u_clean)
     return unique
 
 
@@ -324,14 +328,14 @@ async def _resolve_alert_channel():
 
 
 async def _send_alert(message: str) -> None:
-    """Send a one-line alert to the alert channel. Best-effort, never raises."""
-    channel = await _resolve_alert_channel()
-    if channel is None:
-        return
-    try:
-        await channel.send(message)
-    except Exception:
-        pass
+    """Log error/warning alerts to terminal only. Never sends Discord notifications."""
+    import sys
+    from datetime import datetime
+
+    timestamp = datetime.now().strftime("[%Y-%m-%d %H:%M:%S]")
+    log_message = f"{timestamp} [ALERT] {message}"
+    print(log_message, file=sys.stderr)
+    sys.stderr.flush()
 
 
 def build_embed(
@@ -437,7 +441,7 @@ async def _reply(ctx, content: str | None = None, **kwargs):
 async def checkbanned(
     ctx: commands.Context, file: discord.Attachment = None, *, username: str = None
 ):
-    usernames = await _parse_usernames(ctx, username, attachment=file)
+    usernames = await _parse_usernames(ctx, username, file=file)
     if not usernames:
         await _reply(
             ctx,
@@ -503,7 +507,7 @@ async def checkbanned(
 async def checkunbanned(
     ctx: commands.Context, file: discord.Attachment = None, *, username: str = None
 ):
-    usernames = await _parse_usernames(ctx, username, attachment=file)
+    usernames = await _parse_usernames(ctx, username, file=file)
     if not usernames:
         await _reply(
             ctx,
@@ -570,7 +574,7 @@ async def checkstatus(
     ctx: commands.Context, file: discord.Attachment = None, *, username: str = None
 ):
     await _defer(ctx)
-    usernames = await _parse_usernames(ctx, username, attachment=file)
+    usernames = await _parse_usernames(ctx, username, file=file)
     if not usernames:
         await _reply(
             ctx,
@@ -886,7 +890,7 @@ async def periodic_check():
         await asyncio.sleep(300)
         return
 
-    # Fan-out notifications: only on status transitions
+    # Fan-out notifications: notify when desired status is met, then delete
     for username_lower, (prev_status, new_status, info) in results.items():
         if new_status is None or info is None:
             continue
@@ -895,14 +899,15 @@ async def periodic_check():
             wants_unbanned = w["watch_type"] == "unbanned" and new_status == "active"
             if not (wants_banned or wants_unbanned):
                 continue
-            # Skip if status unchanged from previous check (already notified)
-            if prev_status == new_status:
-                continue
+            # Notify and delete from watchlist (one-shot notification)
             await _notify_watch(w, new_status, info)
 
 
 async def _notify_watch(w: dict, confirmed: str, info: dict) -> None:
-    """Send a ban/unban notification for a single watch and deactivate it."""
+    """Send ban/unban notification to Discord channel. Only logs to terminal."""
+    import sys
+    from datetime import datetime
+
     username = w["username"]
     if confirmed == "active":
         title = f"Account Recovered | @{username} 🏆✅"
@@ -932,7 +937,8 @@ async def _notify_watch(w: dict, confirmed: str, info: dict) -> None:
     except Exception:
         await store.delete_watch(w["id"])
     else:
-        await store.deactivate(w["id"])
+        # Successfully notified - delete from watchlist (one-shot)
+        await store.delete_watch(w["id"])
 
 
 @periodic_check.before_loop

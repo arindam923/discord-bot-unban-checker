@@ -12,8 +12,43 @@ discord.py callbacks and the background task can run concurrently.
 
 import json
 import os
+import re
 import time
 import asyncio
+
+
+def _sanitize_username(username: str) -> list[str]:
+    """Split and sanitize a username string into individual clean usernames.
+
+    Handles corrupted entries like:
+      - 'camping_lovee     @frog_ins' → ['camping_lovee', 'frog_ins']
+      - 'gattouzw\n@its.laraalane\n@Gabebossman' → ['gattouzw', 'its.laraalane', 'gabebossman']
+
+    Returns a list of sanitized usernames that can be safely stored.
+    """
+    if not username:
+        return []
+
+    # Remove @ symbols and strip whitespace
+    cleaned = username.strip().lstrip("@").strip()
+
+    # Split on:
+    # - Multiple spaces (2 or more)
+    # - Newlines (for copy-pasted lists)
+    # - Tabs
+    # - Normal spaces (for single spaces between usernames)
+    parts = re.split(r"\s{2,}|\n|\t", cleaned)
+
+    sanitized = []
+    for part in parts:
+        # Clean each part: remove all whitespace, keep alphanumeric + ._
+        part_clean = re.sub(r"\s+", "", part)
+        part_clean = re.sub(r"[^a-zA-Z0-9_.]", "", part_clean)
+
+        if part_clean:
+            sanitized.append(part_clean)
+
+    return sanitized
 
 
 class WatchStore:
@@ -38,31 +73,49 @@ class WatchStore:
 
     # -- public API -----------------------------------------------------
     async def add_watch(self, guild_id, channel_id, user_id, username, watch_type):
-        """Returns False if an identical active watch already exists."""
+        """Returns False if an identical active watch already exists.
+
+        Sanitizes the username before storing, splitting on multiple spaces,
+        newlines, and tabs to handle corrupted entries like 'camping_lovee     @frog_ins'.
+        """
         async with self.lock:
             data = self._read()
-            for w in data["watches"]:
-                if (
-                    w["guild_id"] == guild_id
-                    and w["username"].lower() == username.lower()
-                    and w["watch_type"] == watch_type
-                    and w["active"]
-                ):
-                    return False
-            watch = {
-                "id": data["next_id"],
-                "guild_id": guild_id,
-                "channel_id": channel_id,
-                "user_id": user_id,
-                "username": username,
-                "watch_type": watch_type,
-                "active": True,
-                "created_at": time.time(),
-            }
-            data["watches"].append(watch)
-            data["next_id"] += 1
-            self._write(data)
-            return True
+
+            # Sanitize username before checking for duplicates
+            sanitized_usernames = _sanitize_username(username)
+
+            # Check for duplicates for each sanitized username
+            for u in sanitized_usernames:
+                for w in data["watches"]:
+                    if (
+                        w["guild_id"] == guild_id
+                        and w["username"].lower() == u.lower()
+                        and w["watch_type"] == watch_type
+                        and w["active"]
+                    ):
+                        return False
+
+            # Create one watch entry for each sanitized username
+            created = False
+            for u in sanitized_usernames:
+                watch = {
+                    "id": data["next_id"],
+                    "guild_id": guild_id,
+                    "channel_id": channel_id,
+                    "user_id": user_id,
+                    "username": u,
+                    "watch_type": watch_type,
+                    "active": True,
+                    "created_at": time.time(),
+                }
+                data["watches"].append(watch)
+                data["next_id"] += 1
+                created = True
+
+            if created:
+                self._write(data)
+
+            return created
 
     async def list_watches(self, guild_id):
         async with self.lock:
