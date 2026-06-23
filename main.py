@@ -156,13 +156,29 @@ async def _parse_usernames(
     username_str: str | None,
     attachment: discord.Attachment | None = None,
 ) -> list[str]:
-    """Parse usernames from command argument (comma-separated) or attached .txt file.
-    Returns a list of clean, case-insensitively deduplicated usernames."""
+    """Parse usernames from command argument (comma/space/newline-separated)
+    or attached .txt file. Returns a list of clean, case-insensitively
+    deduplicated usernames."""
     usernames = []
 
+    def _normalize_one(raw: str) -> str:
+        return raw.strip().lstrip("@").strip()
+
+    def _split_any(s: str) -> list[str]:
+        # Split on commas, newlines, tabs, and runs of whitespace. Allows users
+        # to paste usernames separated by any of those (e.g. copy-pasted from a
+        # chat) without producing malformed compound usernames like
+        # "camping_lovee     @frog_ins".
+        for sep in (",", "\r\n", "\n", "\t"):
+            s = s.replace(sep, " ")
+        return [tok for tok in s.split(" ") if tok]
+
     if username_str:
-        parts = [u.strip().lstrip("@").strip() for u in username_str.split(",")]
-        usernames = [u for u in parts if u]
+        usernames = [
+            _normalize_one(tok)
+            for tok in _split_any(username_str)
+            if _normalize_one(tok)
+        ]
 
     # Gather attachments: explicit parameter (slash command) or message attachments (prefix)
     attachments: list[discord.Attachment] = []
@@ -180,11 +196,10 @@ async def _parse_usernames(
                         async with session.get(att.url) as resp:
                             if resp.status == 200:
                                 content = await resp.text()
-                                lines = content.replace(",", "\n").split("\n")
                                 usernames = [
-                                    u.strip().lstrip("@").strip()
-                                    for u in lines
-                                    if u.strip()
+                                    _normalize_one(tok)
+                                    for tok in _split_any(content)
+                                    if _normalize_one(tok)
                                 ]
                     break
                 except Exception:
