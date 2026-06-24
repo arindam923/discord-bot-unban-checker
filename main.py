@@ -432,6 +432,65 @@ async def _reply(ctx, content: str | None = None, **kwargs):
 
 
 # ---------------------------------------------------------------------------
+# Paginator
+# ---------------------------------------------------------------------------
+
+
+class WatchPaginator(discord.ui.View):
+    """Paginated embed view for the /list command."""
+
+    def __init__(self, lines: list[str], page_size: int = 15):
+        super().__init__(timeout=120)
+        self.lines = lines
+        self.page_size = page_size
+        self.current_page = 0
+        self.total_pages = max(1, (len(lines) + page_size - 1) // page_size)
+        self._update_buttons()
+
+    def _get_page_content(self) -> str:
+        start = self.current_page * self.page_size
+        end = start + self.page_size
+        return "\n".join(self.lines[start:end])
+
+    def _build_embed(self) -> discord.Embed:
+        embed = discord.Embed(
+            title="Currently watched accounts",
+            description=self._get_page_content(),
+        )
+        embed.set_footer(
+            text=f"Page {self.current_page + 1}/{self.total_pages}  •  {len(self.lines)} total"
+        )
+        return embed
+
+    def _update_buttons(self):
+        self.previous.disabled = self.current_page == 0
+        self.next.disabled = self.current_page >= self.total_pages - 1
+
+    @discord.ui.button(label="◀ Previous", style=discord.ButtonStyle.secondary)
+    async def previous(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        self.current_page -= 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self._build_embed(), view=self)
+
+    @discord.ui.button(label="Next ▶", style=discord.ButtonStyle.secondary)
+    async def next(self, interaction: discord.Interaction, button: discord.ui.Button):
+        self.current_page += 1
+        self._update_buttons()
+        await interaction.response.edit_message(embed=self._build_embed(), view=self)
+
+    async def on_timeout(self):
+        for child in self.children:
+            child.disabled = True
+        if hasattr(self, "_message") and self._message:
+            try:
+                await self._message.edit(view=self)
+            except Exception:
+                pass
+
+
+# ---------------------------------------------------------------------------
 # Commands
 # ---------------------------------------------------------------------------
 
@@ -662,7 +721,9 @@ async def list_cmd(ctx: commands.Context):
             "getting banned" if w["watch_type"] == "banned" else "coming back online"
         )
         lines.append(f"• **@{_esc(w['username'])}** — waiting for it to {waiting_for}")
-    await _reply(ctx, "**Currently watched accounts:**\n" + "\n".join(lines))
+
+    view = WatchPaginator(lines)
+    view._message = await _reply(ctx, embed=view._build_embed(), view=view)
 
 
 @bot.hybrid_command(
