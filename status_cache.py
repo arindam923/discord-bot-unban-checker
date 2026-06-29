@@ -10,13 +10,18 @@ loop can:
 Schema (status_cache.json):
 {
   "<username_lower>": {
-    "confirmed": "active" | "banned" | null,
-    "last_checked": <unix_ts>,
-    "last_seen": <unix_ts>,
-    "profile_sig": "<hash>" | null,
-    "avatar_url": "<url>" | null,
-    "retry_after": <unix_ts> | null,
-    "retry_count": <int> | null
+    "confirmed":                 "active" | "banned" | null,
+    "last_checked":              <unix_ts>,
+    "last_seen":                 <unix_ts>,
+    "profile_sig":               "<hash>" | null,
+    "avatar_url":                "<url>"  | null,
+    "retry_after":               <unix_ts> | null,
+    "retry_count":               <int>     | null,
+
+    # socialyze.io bookkeeping (replaces the old per-IP proxy rotation):
+    "socialyze_id":              "<id>"    | null,
+    "socialyze_added_at":        <unix_ts> | null,
+    "last_known_lastScrapedAt":  "<iso8601>" | null
   }
 }
 """

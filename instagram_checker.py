@@ -1,54 +1,61 @@
 """
-Fetches Instagram profile data directly from Instagram's own GraphQL API.
+Fetches Instagram profile data via the socialyze.io API.
 
-NO RapidAPI. NO API key. NO quota. NO monthly limit.
+The bot used to call Instagram's own GraphQL endpoint directly with rotating
+residential proxies, which got expensive. socialyze.io runs the scraper on
+their side and exposes a small JSON API the bot can call directly (no proxy
+needed, no per-IP rate limiting).
 
-Endpoint: www.instagram.com/api/v1/users/web_profile_info/?username=<u>
-Headers:  X-IG-App-ID (Instagram's public web app ID), User-Agent, Referer
+  Base URL:  https://socialyze.io/api/v1/trackers/instagram-followers
+  Auth:      X-API-Key + X-API-Secret headers
+  GET        -> {"data": [Tracker, ...]}     # all trackers on the account
+  POST       -> {"success": true, "data": Tracker}  # add a tracker
 
-This is the same endpoint Instagram's own web frontend calls when you open
-a profile page. It's free, unauthenticated, and returns full profile JSON
-(followers, following, posts, bio, avatar URL) for active accounts, and
-HTTP 404 for banned/deleted/nonexistent accounts.
+Each Tracker payload:
+  {
+    "id":                "cmqyukttf014voqnbmrvxda3m",
+    "username":          "nasa",
+    "fullName":          "NASA" | null,
+    "profilePicUrl":     "https://scontent-...cdninstagram.com/...jpg" | null,
+    "isVerified":        bool,
+    "isPrivate":         bool,
+    "currentFollowers":  int,
+    "currentFollowing":  int,
+    "currentPosts":      int,
+    "dailyChange":       int,
+    "weeklyChange":      int,
+    "monthlyChange":     int,
+    "isTracking":        bool,
+    "lastScrapedAt":     ISO8601 timestamp | null,   # null = never successfully scraped
+    "snapshots":         [{...}, ...]
+  }
 
-Status detection:
-  - "active"       -- HTTP 200 + JSON with user data
-  - "banned"       -- HTTP 404 (account doesn't exist / banned / deleted)
-  - "rate_limited" -- HTTP 429 (per-IP rate limit; needs proxies or slower interval)
-  - "unknown"      -- network error, non-JSON response, parse failure
+Ban detection (heuristic — socialyze has no direct "is banned" flag):
+  - "active"  -> lastScrapedAt is a non-null ISO timestamp
+  - "banned"  -> lastScrapedAt is null AND it's been more than
+                 SOCIALYZE_SCRAPE_GRACE_SECONDS since we POSTed the tracker
+                 (banned/deleted accounts never get a successful scrape)
+  - "unknown" -> lastScrapedAt is null but we're still inside the grace
+                 window (initial scrape not done yet)
+  Active -> banned transition: lastScrapedAt flipping from non-null to null
+  on a tracker that we previously saw scraped = banned.
 
-Anti rate-limit mitigation:
-  A cookie warmup (GET https://www.instagram.com/) seeds the session with
-  `mid`, `csrftoken`, `ig_nrcb` cookies that Instagram issues to real
-  browsers. On a 429 or 401 require_login response we re-warm once and retry
-  the request. This evades soft cookie-less blocks but will NOT help if the
-  egress IP itself is hard-blocked by Instagram (typical for cloud/VPS IPs).
+Avatar bytes are still fetched directly from the Instagram CDN (profilePicUrl).
+The CDN is not behind Cloudflare 1010, so aiohttp works fine for that.
 
-Proxy rotation:
-  Set PROXY_URLS in .env (comma-separated). Two formats are accepted:
-    1) "host:port:user:pass"               (Geonode / sticky-provider style)
-    2) "http://user:pass@host:port"        (standard URL form)
-  Each request routes through the next proxy in round-robin order. With
-  rotating residential backends the same proxy URL hands out a fresh egress
-  IP per call, so retrying a 429 / 401 require_login through the same URL
-  usually re-rolls past the soft block. The cookie jar is wiped before
-  every retry so a soft-blocked device fingerprint from a failed attempt
-  cannot taint the next one.
-
-  When PROXY_URLS is unset, all calls go direct (no proxy).
-
-A shared aiohttp.ClientSession is used for connection pooling. In-memory
-avatar cache keyed by CDN URL avoids re-downloading the same avatar. Card
-render is skipped when the profile signature is unchanged from cache.
+HTTP client:
+  socialyze.io is behind Cloudflare with a browser-fingerprint check that
+  blocks raw aiohttp / urllib (returns "error code: 1010"). We use
+  curl_cffi's AsyncSession with `impersonate="chrome"` so the TLS handshake
+  looks like a real browser. Avatars are fetched with aiohttp.
 """
 
 import asyncio
-import itertools
-import json
 import os
-import ssl
+import time
 
 import aiohttp
+from curl_cffi.requests import AsyncSession
 from dotenv import load_dotenv
 
 from card_renderer import render_profile_card
@@ -56,122 +63,109 @@ from status_cache import compute_profile_sig
 
 load_dotenv()
 
-try:
-    import certifi
+SOCIALYZE_BASE = "https://socialyze.io/api/v1/trackers/instagram-followers"
+SOCIALYZE_API_KEY = os.getenv("SOCIALYZE_API_KEY", "")
+SOCIALYZE_API_SECRET = os.getenv("SOCIALYZE_API_SECRET", "")
 
-    _AIOHTTP_SSL = ssl.create_default_context(cafile=certifi.where())
-except Exception:
-    _AIOHTTP_SSL = None
+# Seconds to wait for socialyze's first scrape before declaring "banned" for
+# a tracker that has never been successfully scraped. Default 5 min.
+try:
+    SOCIALYZE_SCRAPE_GRACE_SECONDS = float(
+        os.getenv("SOCIALYZE_SCRAPE_GRACE_SECONDS", "300")
+    )
+except ValueError:
+    SOCIALYZE_SCRAPE_GRACE_SECONDS = 300.0
 
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Instagram's public web app ID. This is embedded in Instagram's own JS
-# bundle and is used by their web frontend for unauthenticated GraphQL calls.
-# It is NOT a secret and is not tied to any account or quota.
-IG_APP_ID = "936619743392459"
-
-GRAPHQL_URL = "https://www.instagram.com/api/v1/users/web_profile_info/"
-WARMUP_URL = "https://www.instagram.com/"
-
-
-def _parse_proxy_list(raw: str | None) -> list[str]:
-    """Parse PROXY_URLS env var into a list of aiohttp-ready proxy URLs.
-    Accepts both `host:port:user:pass` and `http://user:pass@host:port`."""
-    if not raw:
-        return []
-    out: list[str] = []
-    seen: set[str] = set()
-    for token in raw.split(","):
-        token = token.strip()
-        if not token:
-            continue
-        url = token if "://" in token else _colon_form_to_url(token)
-        if url and url not in seen:
-            seen.add(url)
-            out.append(url)
-    return out
-
-
-def _colon_form_to_url(spec: str) -> str:
-    """Convert 'host:port:user:pass' -> 'http://user:pass@host:port'.
-    Also tolerates 'host:port' (no auth) and 'host:port:user'
-    (user only, no pass)."""
-    parts = spec.split(":")
-    if len(parts) < 2:
-        return ""
-    host, port = parts[0], parts[1]
-    if len(parts) == 2:
-        return f"http://{host}:{port}"
-    user = parts[2]
-    if len(parts) >= 4:
-        pwd = ":".join(parts[3:])  # in case password itself contains ':'
-        return f"http://{user}:{pwd}@{host}:{port}"
-    return f"http://{user}@{host}:{port}"
-
-
-PROXIES: list[str] = _parse_proxy_list(os.getenv("PROXY_URLS"))
-_proxy_cycle = itertools.cycle(PROXIES) if PROXIES else None
-
-# Shared session for connection pooling (lazy-init, lives for bot lifetime)
-_session: aiohttp.ClientSession | None = None
+# Shared sessions (lazy-init, live for bot lifetime)
+_socialyze_session: AsyncSession | None = None
+_avatar_session: aiohttp.ClientSession | None = None
 
 # In-memory avatar cache: url -> bytes (or None if download failed).
 _avatar_url_cache: dict[str, bytes | None] = {}
 
 
-def _next_proxy() -> str | None:
-    """Return the next proxy URL in round-robin order, or None if no proxies."""
-    if _proxy_cycle is None:
-        return None
-    return next(_proxy_cycle)
+def _socialyze_headers() -> dict[str, str]:
+    return {
+        "X-API-Key": SOCIALYZE_API_KEY,
+        "X-API-Secret": SOCIALYZE_API_SECRET,
+        "Accept": "application/json",
+        "Content-Type": "application/json",
+    }
 
 
-async def _get_session() -> aiohttp.ClientSession:
-    global _session
-    if _session is None or _session.closed:
-        connector = aiohttp.TCPConnector(limit=0, limit_per_host=0, ssl=_AIOHTTP_SSL)
-        # unsafe=True so the jar keeps cookies regardless of the host we hit
-        # (warmup host vs GraphQL host both share the .instagram.com domain,
-        # but unsafe guards against any future endpoint/host changes).
-        jar = aiohttp.CookieJar(unsafe=True)
-        _session = aiohttp.ClientSession(
-            timeout=aiohttp.ClientTimeout(total=15),
-            connector=connector,
-            cookie_jar=jar,
-            headers={
-                "User-Agent": USER_AGENT,
-                "X-IG-App-ID": IG_APP_ID,
-                "Accept": "*/*",
-                "Accept-Language": "en-US,en;q=0.9",
-                "Referer": WARMUP_URL,
-            },
+async def _get_socialyze_session() -> AsyncSession:
+    global _socialyze_session
+    if _socialyze_session is None:
+        _socialyze_session = AsyncSession(
+            impersonate="chrome",
+            headers=_socialyze_headers(),
+            timeout=20,
         )
-    return _session
+    return _socialyze_session
 
 
-async def _warmup(proxy: str | None, clear_cookies: bool = False) -> None:
-    """Seed the session with Instagram's browser-issued cookies
-    (mid / csrftoken / ig_nrcb) through the given proxy. Best-effort.
-
-    When `clear_cookies=True`, wipe the jar first so retry attempts get a
-    pristine cookie set issued by the current (rotated) egress IP, not a
-    soft-blocked fingerprint left over from a prior failed attempt."""
-    try:
-        session = await _get_session()
-        if clear_cookies and session.cookie_jar is not None:
-            session.cookie_jar.clear()
-        async with session.get(
-            WARMUP_URL,
-            proxy=proxy,
+async def _get_avatar_session() -> aiohttp.ClientSession:
+    global _avatar_session
+    if _avatar_session is None or _avatar_session.closed:
+        _avatar_session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=15),
-            allow_redirects=True,
-        ):
-            pass
-    except Exception:
-        pass
+            headers={"User-Agent": USER_AGENT},
+        )
+    return _avatar_session
+
+
+async def fetch_all_trackers() -> list[dict]:
+    """GET the full list of trackers on this socialyze account.
+    Returns a (possibly empty) list. Raises on transport errors so callers
+    can surface them as transient 'unknown' rather than caching bad data."""
+    session = await _get_socialyze_session()
+    r = await session.get(SOCIALYZE_BASE)
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"socialyze list returned HTTP {r.status_code}: {r.text[:200]}"
+        )
+    payload = r.json()
+    if not isinstance(payload, dict) or "data" not in payload:
+        raise RuntimeError(f"socialyze list returned unexpected payload: {payload!r}")
+    data = payload.get("data") or []
+    if not isinstance(data, list):
+        raise RuntimeError(f"socialyze list data is not a list: {data!r}")
+    return data
+
+
+def find_tracker_by_username(trackers: list[dict], username: str) -> dict | None:
+    """Linear scan — list is small (tens of items per account). Case-insensitive."""
+    target = username.strip().lstrip("@").lower()
+    for t in trackers:
+        if (t.get("username") or "").lower() == target:
+            return t
+    return None
+
+
+async def add_tracker(username: str) -> dict:
+    """POST a new tracker to socialyze. Returns the created Tracker dict.
+    Raises on transport errors or non-2xx responses. Safe to call for an
+    already-tracked username — socialyze returns the existing tracker and
+    re-scrapes it (a small wasted-scrape cost, not a quota concern)."""
+    clean = username.strip().lstrip("@")
+    session = await _get_socialyze_session()
+    r = await session.post(
+        SOCIALYZE_BASE,
+        json={"url": f"https://www.instagram.com/{clean}/"},
+    )
+    if r.status_code != 200:
+        raise RuntimeError(
+            f"socialyze add returned HTTP {r.status_code}: {r.text[:200]}"
+        )
+    payload = r.json()
+    if not payload.get("success") or not isinstance(payload.get("data"), dict):
+        raise RuntimeError(f"socialyze add returned unexpected payload: {payload!r}")
+    return payload["data"]
 
 
 async def _download_avatar(url: str) -> bytes | None:
@@ -180,13 +174,8 @@ async def _download_avatar(url: str) -> bytes | None:
     if url in _avatar_url_cache:
         return _avatar_url_cache[url]
     try:
-        session = await _get_session()
-        async with session.get(
-            url,
-            proxy=_next_proxy(),
-            headers={"User-Agent": USER_AGENT},
-            timeout=aiohttp.ClientTimeout(total=10),
-        ) as resp:
+        session = await _get_avatar_session()
+        async with session.get(url) as resp:
             if resp.status == 200:
                 data = await resp.read()
                 if data and len(data) > 100:
@@ -198,56 +187,123 @@ async def _download_avatar(url: str) -> bytes | None:
     return None
 
 
-async def _fetch_profile(
-    username: str, proxy: str | None, clear_cookies: bool = False
-) -> tuple[int | None, str | None, dict | None]:
-    """One GraphQL attempt. Returns (status_code, response_text, parsed_json).
-    On connection error returns (None, None, None)."""
-    try:
-        session = await _get_session()
-        await _warmup(proxy, clear_cookies=clear_cookies)
-        async with session.get(
-            GRAPHQL_URL,
-            params={"username": username},
-            proxy=proxy,
-            timeout=aiohttp.ClientTimeout(total=15),
-        ) as resp:
-            text = await resp.text()
-            data = None
-            if resp.status == 200:
-                try:
-                    data = json.loads(text)
-                except Exception:
-                    data = None
-            return resp.status, text, data
-    except Exception:
-        return None, None, None
+def _is_scraped(tracker: dict) -> bool:
+    """Has this tracker been successfully scraped at least once?"""
+    return bool(tracker.get("lastScrapedAt"))
+
+
+def _looks_banned(tracker: dict) -> bool:
+    """Soft-banned heuristic for the case where socialyze successfully
+    scrapes a tracker but the underlying Instagram profile is gone.
+
+    socialyze returns a non-null lastScrapedAt even for nonexistent users,
+    but the profile fields come back empty/default:
+        - fullName == username
+        - profilePicUrl is null
+        - currentFollowers / currentFollowing / currentPosts are all 0
+    A real account — even a brand new one — will have a profile pic and
+    a full name that differs from the handle. The (fullName == username)
+    check is the strongest of these, but requiring all four together
+    keeps the false-positive rate near zero.
+    """
+    if not tracker:
+        return False
+    username = (tracker.get("username") or "").strip().lower()
+    full_name = (tracker.get("fullName") or "").strip().lower()
+    if not username or full_name != username:
+        return False
+    if tracker.get("profilePicUrl"):
+        return False
+    if (tracker.get("currentFollowers") or 0) != 0:
+        return False
+    if (tracker.get("currentFollowing") or 0) != 0:
+        return False
+    if (tracker.get("currentPosts") or 0) != 0:
+        return False
+    return True
+
+
+def _derive_status(
+    tracker: dict | None,
+    socialyze_added_at: float | None,
+    prev_last_scraped_at: str | None,
+) -> str:
+    """Map a tracker + local state to one of active/banned/unknown."""
+    if tracker is None:
+        # No tracker yet. If we've been waiting past the grace period, this
+        # is a banned/deleted account that socialyze can't even create for.
+        # Inside the grace window: unknown.
+        if socialyze_added_at is None:
+            return "unknown"
+        elapsed = time.time() - socialyze_added_at
+        if elapsed >= SOCIALYZE_SCRAPE_GRACE_SECONDS:
+            return "banned"
+        return "unknown"
+
+    # Signal 1: profile data looks empty/default → soft-banned.
+    if _looks_banned(tracker):
+        return "banned"
+
+    last_scraped = tracker.get("lastScrapedAt")
+    if last_scraped:
+        return "active"
+
+    # lastScrapedAt is null. Was it previously scraped (active -> banned)?
+    if prev_last_scraped_at:
+        return "banned"
+    # Never scraped since we added it — inside grace = unknown, past = banned.
+    if socialyze_added_at is None:
+        return "unknown"
+    elapsed = time.time() - socialyze_added_at
+    if elapsed >= SOCIALYZE_SCRAPE_GRACE_SECONDS:
+        return "banned"
+    return "unknown"
 
 
 async def check_instagram_account(
-    username: str, output_path: str, cached_sig: str | None = None
+    username: str,
+    output_path: str,
+    cached_sig: str | None = None,
+    cached_state: dict | None = None,
+    trackers_cache: list[dict] | None = None,
 ) -> dict:
     """
-    Fetch profile status + data from Instagram's GraphQL API.
+    Look up the username in socialyze and produce a status + profile payload.
 
-    If cached_sig matches the newly computed profile signature AND the PNG
-    already exists, the card render is skipped (byte-identical output).
+    cached_state (optional):
+        Previous state dict from status_cache, carrying:
+          - socialyze_id: str | None
+          - socialyze_added_at: float | None
+          - last_known_lastScrapedAt: str | None
+          - confirmed: str | None  (previous status)
+        Used to detect active -> banned transitions and to honour the grace
+        window for never-scraped trackers.
 
-    Returns a dict:
+    trackers_cache (optional):
+        Pre-fetched list from fetch_all_trackers(). When None, we fetch it
+        on demand. Passing it in lets the periodic loop batch one GET per
+        tick across many accounts instead of one GET per account.
+
+    Returns a dict shaped exactly like the old GraphQL version so the rest
+    of the bot (card renderer, embeds, status cache) doesn't need to change:
+
       {
-        "status": "active" | "banned" | "rate_limited" | "unknown",
-        "image": path-or-None,
-        "followers": int-or-None,
-        "following": int-or-None,
-        "posts": int-or-None,
-        "full_name": str-or-None,
-        "bio": str-or-None,
-        "avatar_bytes": bytes-or-None,
-        "avatar_url": str-or-None,
+        "status":      "active" | "banned" | "unknown",
+        "image":       path-or-None,
+        "followers":   int-or-None,
+        "following":   int-or-None,
+        "posts":       int-or-None,
+        "full_name":   str-or-None,
+        "bio":         None,                       # socialyze doesn't expose bio
+        "avatar_bytes":bytes-or-None,
+        "avatar_url":  str-or-None,                # = profilePicUrl
         "profile_sig": str-or-None,
+        "_socialyze_id":             str-or-None,  # caller persists this
+        "_socialyze_added_at":       float-or-None,
+        "_last_known_lastScrapedAt": str-or-None,
       }
     """
-    result = {
+    result: dict = {
         "status": "unknown",
         "image": None,
         "followers": None,
@@ -258,48 +314,74 @@ async def check_instagram_account(
         "avatar_bytes": None,
         "avatar_url": None,
         "profile_sig": None,
+        "_socialyze_id": None,
+        "_socialyze_added_at": None,
+        "_last_known_lastScrapedAt": None,
     }
 
-    # Attempt count: with rotating residential proxies the same proxy URL
-    # hands out a fresh egress IP per request, so retrying across attempts
-    # re-rolls the IP. Cap at 5 so a stuck proxy doesn't burn all bandwidth.
-    if PROXIES:
-        attempts = min(max(len(PROXIES), 3), 5)
-    else:
-        attempts = 1
+    cached_state = cached_state or {}
+    socialyze_id = cached_state.get("socialyze_id")
+    socialyze_added_at = cached_state.get("socialyze_added_at")
+    prev_last_scraped_at = cached_state.get("last_known_lastScrapedAt")
 
-    data: dict | None = None
-    final_status_code: int | None = None
-    final_text: str | None = None
-    last_was_401_login = False
+    if trackers_cache is None:
+        try:
+            trackers_cache = await fetch_all_trackers()
+        except Exception:
+            return result  # transient error → unknown
 
-    for attempt in range(attempts):
-        proxy = _next_proxy() if PROXIES else None
-        code, text, parsed = await _fetch_profile(
-            username, proxy, clear_cookies=attempt > 0
-        )
-        if code is None:
-            # Connection error through this proxy → try next proxy.
-            continue
-        final_status_code = code
-        final_text = text
-        # Retryable rate-limit signals: 429, 401 require_login. Try next proxy.
-        if code == 429 and attempt < attempts - 1:
-            await asyncio.sleep(1)
-            continue
-        if code == 401 and "require_login" in (text or ""):
-            last_was_401_login = True
-            if attempt < attempts - 1:
-                await asyncio.sleep(1)
-                continue
-        if code == 200 and parsed is not None:
-            data = parsed
-        break
+    tracker = find_tracker_by_username(trackers_cache, username)
 
-    if data is None:
-        if final_status_code == 404:
-            result["status"] = "banned"
-            new_sig = compute_profile_sig("banned", None, None, None, None, None, None)
+    # If the tracker is gone from socialyze (deleted by admin / never created /
+    # lost after a quota reset) AND we have a prior id we know about, that's
+    # a hard "banned" — but only if we've given socialyze time to come back.
+    # Inside grace window, treat as unknown (just slow to appear in the list).
+    if tracker is None and socialyze_id is None and socialyze_added_at is None:
+        # First time we've ever seen this username, and the list doesn't
+        # contain it. Try to add it.
+        try:
+            tracker = await add_tracker(username)
+            socialyze_id = tracker.get("id")
+            socialyze_added_at = time.time()
+        except Exception:
+            return result  # couldn't add right now → unknown
+
+    elif tracker is None and socialyze_id is not None:
+        # We had a tracker before but it's gone from the list. Re-add it.
+        # socialyze dedupes by username, so this is safe and idempotent.
+        try:
+            tracker = await add_tracker(username)
+            socialyze_id = tracker.get("id")
+            # Don't reset socialyze_added_at — keep the original "first seen"
+            # timestamp so the grace window reflects how long THIS account
+            # has been unbannable, not how long since the re-add.
+            if socialyze_added_at is None:
+                socialyze_added_at = time.time()
+        except Exception:
+            # If we can't re-add, treat as banned only if we know the account
+            # existed at some point and the prior lastScrapedAt was set.
+            if prev_last_scraped_at:
+                result["status"] = "banned"
+            return result
+
+    status = _derive_status(tracker, socialyze_added_at, prev_last_scraped_at)
+    result["status"] = status
+
+    # Persist bookkeeping for the caller.
+    result["_socialyze_id"] = (
+        tracker.get("id") if tracker else socialyze_id
+    )
+    result["_socialyze_added_at"] = socialyze_added_at
+    result["_last_known_lastScrapedAt"] = (
+        tracker.get("lastScrapedAt") if tracker else prev_last_scraped_at
+    )
+
+    if status != "active" or tracker is None:
+        # For "banned" we still render a banned card (no profile data).
+        if status == "banned":
+            new_sig = compute_profile_sig(
+                "banned", None, None, None, None, None, None
+            )
             result["profile_sig"] = new_sig
             if cached_sig and cached_sig == new_sig and os.path.exists(output_path):
                 result["image"] = output_path
@@ -313,38 +395,26 @@ async def check_instagram_account(
                     result["image"] = output_path
                 except Exception:
                     pass
-            return result
-        if final_status_code in (429, 401) and (
-            final_status_code == 429
-            or last_was_401_login
-            or "require_login" in (final_text or "")
-        ):
-            result["status"] = "rate_limited"
-            return result
-        if final_status_code is not None:
-            result["status"] = "unknown"
-            return result
-        # No proxy/connection succeeded at all
-        result["status"] = "rate_limited"
         return result
 
-    user = (data.get("data") or {}).get("user")
-    if not user:
-        result["status"] = "unknown"
-        return result
-
-    result["status"] = "active"
-    result["full_name"] = user.get("full_name") or None
-    result["bio"] = user.get("biography") or None
-
-    followers = (user.get("edge_followed_by") or {}).get("count")
-    following = (user.get("edge_follow") or {}).get("count")
-    posts = (user.get("edge_owner_to_timeline_media") or {}).get("count")
-    result["followers"] = int(followers) if isinstance(followers, int) else None
-    result["following"] = int(following) if isinstance(following, int) else None
-    result["posts"] = int(posts) if isinstance(posts, int) else None
-
-    avatar_url = user.get("profile_pic_url_hd") or user.get("profile_pic_url")
+    # Active: pull profile fields from the tracker.
+    result["full_name"] = tracker.get("fullName") or None
+    result["followers"] = (
+        int(tracker["currentFollowers"])
+        if isinstance(tracker.get("currentFollowers"), (int, float))
+        else None
+    )
+    result["following"] = (
+        int(tracker["currentFollowing"])
+        if isinstance(tracker.get("currentFollowing"), (int, float))
+        else None
+    )
+    result["posts"] = (
+        int(tracker["currentPosts"])
+        if isinstance(tracker.get("currentPosts"), (int, float))
+        else None
+    )
+    avatar_url = tracker.get("profilePicUrl") or None
     result["avatar_url"] = avatar_url
 
     new_sig = compute_profile_sig(
@@ -358,7 +428,6 @@ async def check_instagram_account(
     )
     result["profile_sig"] = new_sig
 
-    # Card cache: skip render if profile inputs are unchanged and PNG exists
     if cached_sig and cached_sig == new_sig and os.path.exists(output_path):
         result["image"] = output_path
     else:
@@ -384,7 +453,16 @@ async def check_instagram_account(
 
 
 async def close_session() -> None:
-    global _session
-    if _session is not None and not _session.closed:
-        await _session.close()
-        _session = None
+    global _socialyze_session, _avatar_session
+    if _socialyze_session is not None:
+        try:
+            await _socialyze_session.close()
+        except Exception:
+            pass
+        _socialyze_session = None
+    if _avatar_session is not None and not _avatar_session.closed:
+        try:
+            await _avatar_session.close()
+        except Exception:
+            pass
+        _avatar_session = None

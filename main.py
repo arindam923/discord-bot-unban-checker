@@ -10,32 +10,34 @@ Commands (work as both slash commands and !prefix commands):
   botstatus                 - show cache stats and loop diagnostics
 
 Polling architecture:
-  The loop ticks every CHECK_INTERVAL_SECONDS (60s), but individual accounts
-  are only checked based on their last known status (tiered frequency):
+  The loop ticks every CHECK_INTERVAL_SECONDS, but individual accounts are
+  only checked based on their last known status (tiered frequency):
     - Active accounts  → every 5 min  (bans are rare, no need to poll hard)
     - Banned accounts  → every 1 min  (user wants fast unban detection)
     - Unknown accounts → every 2 min  (retry cadence)
 
   This cuts API calls by ~87% vs checking all accounts every tick.
 
-  Each check calls Instagram's own GraphQL API
-  (i.instagram.com/api/v1/users/web_profile_info/) — no RapidAPI, no API
-  key, no monthly quota. This is the same endpoint Instagram's web frontend
-  uses, and it's free and unauthenticated.
+  Each tick does ONE GET to socialyze.io to fetch every tracker in the
+  account, then looks up each watched username in that single response.
+  socialyze runs the scraper on their side, so the bot does not hit
+  Instagram directly and does not need a proxy rotation (the previous
+  Instagram-GraphQL path with PROXY_URLS was removed because rotating
+  residential proxies got too expensive).
 
-  For each account:
-    - HTTP 200 + JSON → status="active", full profile data available
-    - HTTP 404       → status="banned" (account gone)
-    - HTTP 429/401   → status="rate_limited" (deferred with backoff)
+  Ban detection (heuristic — socialyze has no direct "is banned" field):
+    - "active"  = tracker's lastScrapedAt is a non-null timestamp
+    - "banned"  = tracker's lastScrapedAt is null AND either (a) we've
+                  been waiting > SOCIALYZE_SCRAPE_GRACE_SECONDS for the
+                  first scrape, or (b) we previously saw a non-null
+                  lastScrapedAt and it has now flipped to null
+                  (active -> banned transition)
+    - "unknown" = tracker's lastScrapedAt is null and we're still
+                  inside the grace window for a fresh tracker
 
-   A persistent status_cache.json tracks the last status + profile signature
-   per username. If both are unchanged, the card PNG render is skipped.
-   Notifications only fire on actual status transitions (active↔banned).
-
-   If Instagram rate-limits a request, the account is deferred with
-   exponential backoff (60s → 15 min max) so it retries automatically
-   without blocking the sweep. Set PROXY_URLS in .env to rotate across
-   egress IPs and reduce rate-limiting.
+  A persistent status_cache.json tracks the last status + profile signature
+  per username. If both are unchanged, the card PNG render is skipped.
+  Notifications only fire on actual status transitions (active↔banned).
 """
 
 import asyncio
@@ -62,7 +64,7 @@ except Exception:
     _SSL_CTX = None
 
 from card_renderer import render_profile_card
-from instagram_checker import check_instagram_account
+from instagram_checker import check_instagram_account, fetch_all_trackers
 from status_cache import StatusCache
 from storage import WatchStore, _sanitize_username
 
@@ -76,16 +78,17 @@ def _esc(username: str) -> str:
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
 
-# Polling interval (seconds). The loop ticks every 60s, but individual
+# Polling interval (seconds). The loop ticks this often, but individual
 # accounts are only checked based on their tier interval below (not every
 # tick). This dramatically reduces API calls — active accounts are only
 # checked every 5 min, banned every 1 min, etc.
 CHECK_INTERVAL_SECONDS = 120
 
-# How many accounts to fetch in parallel inside one tick.
-# 8 is safe from one IP without triggering Instagram's soft rate limit.
-# If you consistently get rate_limited, lower this to 4 or add proxies.
-CHECK_CONCURRENCY = 3
+# How many accounts to process in parallel inside one tick for the
+# non-network parts (card render, avatar download from the Instagram CDN).
+# The network cost per tick is ONE GET to socialyze.io regardless of how
+# many accounts are due, so this knob is only about local concurrency.
+CHECK_CONCURRENCY = 8
 
 # Status-based check frequency (seconds since last_checked).
 # Active accounts are checked less often (bans are rare events).
@@ -648,13 +651,26 @@ async def checkstatus(
         "banned": "Account Banned | @{u} ❌",
     }
 
+    try:
+        trackers = await fetch_all_trackers()
+    except Exception as e:
+        await _reply(ctx, f"❌ socialyze.io list failed: {e!r}")
+        return
+
     sem = asyncio.Semaphore(CHECK_CONCURRENCY)
 
     async def _check_one_status(uname: str):
         async with sem:
             path = os.path.join(CARD_DIR, f"status_{uname}.png")
+            cached = await status_cache.get(uname)
             try:
-                return await check_instagram_account(uname, path)
+                return await check_instagram_account(
+                    uname,
+                    path,
+                    cached_sig=(cached or {}).get("profile_sig"),
+                    cached_state=cached or {},
+                    trackers_cache=trackers,
+                )
             except Exception as e:
                 return {"status": "unknown", "_error": repr(e), "image": None}
 
@@ -857,7 +873,7 @@ async def forcecheck(ctx: commands.Context):
 
 @tasks.loop(seconds=CHECK_INTERVAL_SECONDS)
 async def periodic_check():
-    """Fetch due accounts via Instagram's free GraphQL API.
+    """One socialyze.io GET per tick, then per-account book-keeping.
     Accounts are checked on a tiered schedule based on their last known
     status (active=5min, banned=1min, unknown=2min). Skip card render for
     unchanged accounts. Notify on status transitions."""
@@ -882,6 +898,15 @@ async def periodic_check():
     if not due_usernames:
         return
 
+    # ONE GET for the whole tick — the whole tracker list at once. Every
+    # due account below looks itself up in this in-memory list, so the
+    # per-account cost is just card-render + avatar download.
+    try:
+        trackers = await fetch_all_trackers()
+    except Exception:
+        _loop_stats["errors"] += 1
+        return
+
     sweep_start = time.time()
     sem = asyncio.Semaphore(CHECK_CONCURRENCY)
     # results: username_lower -> (prev_status, new_status, info)
@@ -892,14 +917,20 @@ async def periodic_check():
     async def _check_one(username_lower: str) -> None:
         nonlocal iter_cache_hits, iter_cache_misses
         orig = grouped[username_lower][0]["username"]
-        cached = await status_cache.get(username_lower)
-        cached_sig = cached.get("profile_sig") if cached else None
-        prev_status = cached.get("confirmed") if cached else None
+        cached = await status_cache.get(username_lower) or {}
+        cached_sig = cached.get("profile_sig")
+        prev_status = cached.get("confirmed")
 
         async with sem:
             path = os.path.join(CARD_DIR, f"{orig}.png")
             try:
-                info = await check_instagram_account(orig, path, cached_sig=cached_sig)
+                info = await check_instagram_account(
+                    orig,
+                    path,
+                    cached_sig=cached_sig,
+                    cached_state=cached,
+                    trackers_cache=trackers,
+                )
                 _loop_stats["checks"] += 1
             except Exception:
                 _loop_stats["errors"] += 1
@@ -907,11 +938,6 @@ async def periodic_check():
                 return
 
         status = info["status"]
-
-        if status == "rate_limited":
-            await status_cache.set_rate_limited(username_lower)
-            results[username_lower] = (prev_status, None, None)
-            return
 
         if status not in ("active", "banned"):
             results[username_lower] = (prev_status, None, None)
@@ -936,6 +962,9 @@ async def periodic_check():
                 "last_seen": time.time(),
                 "profile_sig": info.get("profile_sig"),
                 "avatar_url": info.get("avatar_url"),
+                "socialyze_id": info.get("_socialyze_id"),
+                "socialyze_added_at": info.get("_socialyze_added_at"),
+                "last_known_lastScrapedAt": info.get("_last_known_lastScrapedAt"),
             },
         )
         results[username_lower] = (prev_status, status, info)
