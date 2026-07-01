@@ -64,7 +64,7 @@ except Exception:
     _SSL_CTX = None
 
 from card_renderer import render_profile_card
-from instagram_checker import check_instagram_account, fetch_all_trackers
+from instagram_checker import check_instagram_account, fetch_all_trackers, maybe_rescrape
 from status_cache import StatusCache
 from storage import WatchStore, _sanitize_username
 
@@ -96,7 +96,7 @@ CHECK_CONCURRENCY = 8
 # Unknown accounts retry at a medium cadence.
 TIER_INTERVALS = {
     "active": 300,  # 5 minutes
-    "banned": 60,  # 1 minute
+    "banned": 30,  # 30 seconds (rescrape every minute for fast unban detection)
     "unknown": 120,  # 2 minutes
     None: 60,  # default for never-checked accounts
 }
@@ -921,6 +921,15 @@ async def periodic_check():
         cached_sig = cached.get("profile_sig")
         prev_status = cached.get("confirmed")
 
+        # Force a socialyze re-scrape for accounts with "unbanned" watches
+        # (time-sensitive: user wants to know the moment the account recovers).
+        # maybe_rescrape() is cheap when the interval hasn't elapsed.
+        has_unbanned_watch = any(
+            w["watch_type"] == "unbanned" for w in grouped[username_lower]
+        )
+        if has_unbanned_watch:
+            await maybe_rescrape(orig)
+
         async with sem:
             path = os.path.join(CARD_DIR, f"{orig}.png")
             try:
@@ -992,8 +1001,11 @@ async def periodic_check():
 
 async def _notify_watch(w: dict, confirmed: str, info: dict) -> None:
     """Send ban/unban notification to Discord channel. Only logs to terminal."""
+    import logging
     import sys
     from datetime import datetime
+
+    _log = logging.getLogger(__name__)
 
     username = w["username"]
     if confirmed == "active":
@@ -1004,6 +1016,29 @@ async def _notify_watch(w: dict, confirmed: str, info: dict) -> None:
     created_at = w.get("created_at", time.time())
     elapsed = time.time() - created_at
     embed = build_embed(title, username, info, elapsed_seconds=elapsed)
+
+    # If the card image wasn't rendered during the check (e.g., render
+    # failed silently), try a one-shot fallback render right now.
+    if not info.get("image") or not os.path.exists(info["image"]):
+        fallback_path = os.path.join(CARD_DIR, f"fallback_{username}.png")
+        try:
+            render_profile_card(
+                username=username,
+                output_path=fallback_path,
+                status=confirmed,
+                full_name=info.get("full_name"),
+                bio=info.get("bio"),
+                posts=info.get("posts"),
+                followers=info.get("followers"),
+                following=info.get("following"),
+                avatar_bytes=info.get("avatar_bytes"),
+            )
+            info["image"] = fallback_path
+        except Exception:
+            _log.exception(
+                "Fallback card render failed for %s (status=%s)", username, confirmed
+            )
+
     file = attach_card_image(embed, info)
 
     channel = await _resolve_channel(w["channel_id"], w.get("guild_id"))

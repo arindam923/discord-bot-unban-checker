@@ -51,6 +51,7 @@ HTTP client:
 """
 
 import asyncio
+import logging
 import os
 import time
 
@@ -60,6 +61,8 @@ from dotenv import load_dotenv
 
 from card_renderer import render_profile_card
 from status_cache import compute_profile_sig
+
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
@@ -76,6 +79,18 @@ try:
 except ValueError:
     SOCIALYZE_SCRAPE_GRACE_SECONDS = 300.0
 
+# Minimum interval between forced re-scrapes of an already-tracked username.
+# Calling add_tracker() on an existing tracker tells socialyze to re-scrape
+# it now instead of waiting for its own internal schedule (which can be
+# hours). Default 60s — aggressive enough for fast unban detection without
+# hammering socialyze on every 30s tick.
+try:
+    SOCIALYZE_FORCE_RESCROPE_INTERVAL = float(
+        os.getenv("SOCIALYZE_FORCE_RESCROPE_INTERVAL", "60")
+    )
+except ValueError:
+    SOCIALYZE_FORCE_RESCROPE_INTERVAL = 60.0
+
 USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
@@ -87,6 +102,32 @@ _avatar_session: aiohttp.ClientSession | None = None
 
 # In-memory avatar cache: url -> bytes (or None if download failed).
 _avatar_url_cache: dict[str, bytes | None] = {}
+
+# Track when each username was last force-rescraped to avoid hammering
+# socialyze on every check tick.
+_last_rescrape: dict[str, float] = {}
+
+
+async def maybe_rescrape(username: str) -> bool:
+    """Call add_tracker() to force socialyze to re-scrape now.
+
+    Returns True if a rescrape was triggered, False if skipped because the
+    interval hasn't elapsed yet. add_tracker() is idempotent and safe to
+    call for already-tracked usernames — socialyze returns the existing
+    tracker and re-scrapes it (a small wasted-scrape cost, not a quota
+    concern per their docs).
+    """
+    key = username.strip().lstrip("@").lower()
+    now = time.time()
+    last = _last_rescrape.get(key, 0)
+    if now - last < SOCIALYZE_FORCE_RESCROPE_INTERVAL:
+        return False
+    try:
+        await add_tracker(username)
+    except Exception:
+        return False
+    _last_rescrape[key] = now
+    return True
 
 
 def _socialyze_headers() -> dict[str, str]:
@@ -394,7 +435,7 @@ async def check_instagram_account(
                     )
                     result["image"] = output_path
                 except Exception:
-                    pass
+                    logger.exception("render_profile_card failed for banned %s", username)
         return result
 
     # Active: pull profile fields from the tracker.
@@ -447,6 +488,7 @@ async def check_instagram_account(
             )
             result["image"] = output_path
         except Exception:
+            logger.exception("render_profile_card failed for active %s", username)
             result["image"] = None
 
     return result
